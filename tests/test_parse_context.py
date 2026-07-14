@@ -1,5 +1,8 @@
 """Tests for src/parse_context.py — hook context parser (feature 003)."""
+import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -123,3 +126,35 @@ def test_detached_head_branch_is_valid():
     ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="HEAD",
                              HOOK_FILES=""), "/repo")
     assert ctx["branch"] == "HEAD" and ctx["partial"] is False
+
+
+def _run_cli(env):
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "src" / "parse_context.py")],
+        env={"PATH": "/usr/bin:/bin", **env}, cwd=REPO_ROOT,
+        capture_output=True, text=True, timeout=10,
+    )
+
+
+def test_cli_complete_context_exit_zero():
+    r = _run_cli({"HOOK_EVENT": "pre-commit", "HOOK_BRANCH": "main",
+                  "HOOK_FILES": "a.py"})
+    assert r.returncode == 0
+    ctx = json.loads(r.stdout)
+    assert ctx["event"] == "pre-commit" and set(ctx) == SCHEMA_KEYS
+
+
+def test_cli_empty_environment_still_exit_zero():
+    r = _run_cli({})
+    assert r.returncode == 0
+    ctx = json.loads(r.stdout)
+    assert ctx["partial"] is True
+
+
+def test_thousand_files_under_one_second():
+    files = "\n".join(f"src/mod_{i}.py" for i in range(1000))
+    t0 = time.monotonic()
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                             HOOK_FILES=files), "/repo")
+    assert time.monotonic() - t0 < 1.0
+    assert len(ctx["files"]) == 1000

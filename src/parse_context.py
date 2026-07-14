@@ -9,8 +9,10 @@ abort the triggering git operation.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import sys
 from collections.abc import Mapping
 
 SCHEMA_VERSION = "1.0"
@@ -92,3 +94,26 @@ def parse_context(env: Mapping[str, str], repo_root: str) -> dict:
         "unavailable": unavailable,
         "errors": errors,
     }
+
+
+def main() -> int:
+    try:
+        context = parse_context(os.environ, os.getcwd())
+    except Exception as exc:  # SC-005: never abort the triggering git operation
+        context = {
+            "schema_version": SCHEMA_VERSION,
+            "event": None,
+            "branch": None,
+            "files": [],
+            "commits": [],
+            "partial": True,
+            "unavailable": ["event", "branch", "files", "commits"],
+            "errors": [f"parser failure: {exc}"],
+        }
+    json.dump(context, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
