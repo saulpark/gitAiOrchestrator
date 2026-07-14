@@ -55,3 +55,24 @@ def test_pre_push_includes_commits():
                              HOOK_FILES="p.py", HOOK_COMMITS=sha), "/repo")
     assert ctx["commits"] == [sha]
     assert ctx["partial"] is False
+
+
+def test_files_deduped_sorted_blanks_dropped():
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                             HOOK_FILES="b.py\n\n  \na.py\nb.py\n./c.py"), "/repo")
+    assert ctx["files"] == ["a.py", "b.py", "c.py"]
+
+
+def test_absolute_path_inside_repo_relativized():
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                             HOOK_FILES="/repo/src/x.py"), "/repo")
+    assert ctx["files"] == ["src/x.py"]
+    assert ctx["partial"] is False
+
+
+def test_absolute_path_outside_repo_dropped_with_error():
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                             HOOK_FILES="/etc/passwd\na.py"), "/repo")
+    assert ctx["files"] == ["a.py"]
+    assert any("outside repository" in e for e in ctx["errors"])
+    assert ctx["partial"] is False  # dropped path is noted, not an unavailability
