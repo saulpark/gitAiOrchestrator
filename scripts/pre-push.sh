@@ -6,18 +6,23 @@ ZERO="0000000000000000000000000000000000000000"
 HOOK_EVENT="pre-push"
 HOOK_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 HOOK_FILES=""
+HOOK_COMMITS=""
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$ZERO" ] && continue
     if [ "$remote_sha" = "$ZERO" ]; then
-        FILES=$(git rev-list "$local_sha" --not --remotes | while read -r c; do
-            git diff-tree -r --name-only --no-commit-id "$c"; done | sort -u)
+        REVS=$(git rev-list "$local_sha" --not --remotes)
     else
-        FILES=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)
+        REVS=$(git rev-list "$remote_sha..$local_sha" 2>/dev/null)
     fi
+    [ -z "$REVS" ] && continue
+    FILES=$(printf '%s\n' "$REVS" | while read -r c; do
+        git diff-tree -r --name-only --no-commit-id "$c"; done | sort -u)
+    HOOK_COMMITS="${HOOK_COMMITS}${REVS}
+"
     [ -n "$FILES" ] && HOOK_FILES="${HOOK_FILES}${FILES}
 "
 done
-export HOOK_EVENT HOOK_BRANCH HOOK_FILES
+export HOOK_EVENT HOOK_BRANCH HOOK_FILES HOOK_COMMITS
 
 _run_with_timeout "$(_hook_root)/scripts/orchestrate.sh"
 EXIT=$?
