@@ -76,3 +76,50 @@ def test_absolute_path_outside_repo_dropped_with_error():
     assert ctx["files"] == ["a.py"]
     assert any("outside repository" in e for e in ctx["errors"])
     assert ctx["partial"] is False  # dropped path is noted, not an unavailability
+
+
+def test_missing_event_and_branch_partial():
+    ctx = parse_context(_env(HOOK_FILES="a.py"), "/repo")
+    assert ctx["event"] is None and ctx["branch"] is None
+    assert ctx["partial"] is True
+    assert set(ctx["unavailable"]) == {"event", "branch"}
+    assert set(ctx) == SCHEMA_KEYS  # full key set even when partial
+
+
+def test_unknown_event_marked_unavailable():
+    ctx = parse_context(_env(HOOK_EVENT="post-checkout", HOOK_BRANCH="b",
+                             HOOK_FILES=""), "/repo")
+    assert ctx["event"] is None
+    assert "event" in ctx["unavailable"]
+    assert any("post-checkout" in e for e in ctx["errors"])
+
+
+def test_unset_files_unavailable_but_empty_files_valid():
+    unset = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b"), "/repo")
+    assert "files" in unset["unavailable"] and unset["partial"] is True
+    empty = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                               HOOK_FILES=""), "/repo")
+    assert empty["files"] == [] and empty["partial"] is False
+
+
+def test_commits_unavailable_only_for_pre_push():
+    push = parse_context(_env(HOOK_EVENT="pre-push", HOOK_BRANCH="b",
+                              HOOK_FILES="a.py"), "/repo")
+    assert "commits" in push["unavailable"]
+    commit = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                                HOOK_FILES="a.py"), "/repo")
+    assert "commits" not in commit["unavailable"]
+
+
+def test_invalid_commit_token_dropped_with_error():
+    good = "b" * 40
+    ctx = parse_context(_env(HOOK_EVENT="pre-push", HOOK_BRANCH="b", HOOK_FILES="",
+                             HOOK_COMMITS=f"{good}\nnot-a-sha\n{good}"), "/repo")
+    assert ctx["commits"] == [good]  # deduped, order preserved
+    assert any("not-a-sha" in e for e in ctx["errors"])
+
+
+def test_detached_head_branch_is_valid():
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="HEAD",
+                             HOOK_FILES=""), "/repo")
+    assert ctx["branch"] == "HEAD" and ctx["partial"] is False
