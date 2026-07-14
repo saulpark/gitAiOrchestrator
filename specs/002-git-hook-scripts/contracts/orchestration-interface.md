@@ -36,6 +36,10 @@ HOOK_FILES="<newline_delimited_files>" \
 | `HOOK_EVENT` | Yes | One of: `pre-commit`, `post-merge`, `pre-push` | `pre-commit` |
 | `HOOK_BRANCH` | Yes | Branch name string; `HEAD` for detached state | `main` |
 | `HOOK_FILES` | Yes | Newline-delimited file paths; empty string if none | `src/foo.py\nsrc/bar.py` |
+| `HOOK_COMMITS` | pre-push only (v1.1, added by 003) | Newline-delimited full SHAs of pushed commits | `c9997cf…\nda44c5f…` |
+
+> **v1.1 addendum (2026-07-14, feature 003)**: `pre-push.sh` additionally exports
+> `HOOK_COMMITS` — see [003 context-schema contract](../../003-hook-context-parser/contracts/context-schema.md).
 
 ---
 
