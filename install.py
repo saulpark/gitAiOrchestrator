@@ -354,7 +354,7 @@ def main() -> None:
     config = InstallConfig(
         hooks_path=".githooks",
         dirs_to_create=[".githooks", "scripts", "logs"],
-        hooks_to_install=["post-commit", "pre-push", "post-merge"],
+        hooks_to_install=["pre-commit", "pre-push", "post-merge"],
         scripts_to_chmod=[],
     )
 
