@@ -8,9 +8,11 @@ consult): specs/005-skill-contract/contracts/skill-contract.md
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+import sys
 
 CONTRACT_VERSION = "1.0"
 RESERVED_NAMES = frozenset({"registry", "contract", "skills"})
@@ -68,3 +70,170 @@ def validate_manifest(skill_dir: str) -> list[str]:
         violations.append(f"entry-point: executable 'run' missing at {run_path}")
 
     return violations
+
+
+def _registry_path(skills_dir: str) -> str:
+    return os.path.join(skills_dir, "registry.json")
+
+
+def load_registry(skills_dir: str, warnings: list[str]) -> dict:
+    empty = {"contract_version": CONTRACT_VERSION, "skills": {}}
+    path = _registry_path(skills_dir)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            reg = json.load(fh)
+        if not isinstance(reg, dict) or not isinstance(reg.get("skills"), dict):
+            raise ValueError("registry must be an object with a 'skills' object")
+    except FileNotFoundError:
+        warnings.append(f"registry not found: {path}")
+        return empty
+    except (OSError, ValueError) as exc:
+        warnings.append(f"registry unreadable ({path}): {exc}")
+        return empty
+    reg.setdefault("contract_version", CONTRACT_VERSION)
+    return reg
+
+
+def _save_registry(skills_dir: str, registry: dict) -> None:
+    registry["contract_version"] = CONTRACT_VERSION
+    os.makedirs(skills_dir, exist_ok=True)
+    with open(_registry_path(skills_dir), "w", encoding="utf-8") as fh:
+        json.dump(registry, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def register_skill(skills_dir: str, skill_dir: str,
+                   update: bool = False) -> tuple[bool, list[str]]:
+    """Validate and add a skill. Returns (accepted, messages).
+
+    On rejection, messages is the complete violation list (SC-003) and the
+    registry is left untouched (SC-002).
+    """
+    violations = validate_manifest(skill_dir)
+    if violations:
+        return False, violations
+
+    with open(os.path.join(skill_dir, "skill.json"), encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    name = manifest["name"]
+
+    registry = load_registry(skills_dir, [])
+    if name in registry["skills"] and not update:
+        return False, [f"duplicate-name: '{name}' is already registered "
+                       f"(pass --update to re-register with intent)"]
+
+    registry["skills"][name] = {
+        "dir": os.path.basename(os.path.normpath(skill_dir)),
+        "version": manifest["version"],
+        "description": manifest["description"],
+    }
+    _save_registry(skills_dir, registry)
+    return True, [f"registered '{name}' (contract {CONTRACT_VERSION})"]
+
+
+def deregister_skill(skills_dir: str, name: str,
+                     routes_path: str | None) -> tuple[bool, list[str]]:
+    """Remove a skill; warn when the routing config still references it (FR-007)."""
+    registry = load_registry(skills_dir, [])
+    if name not in registry["skills"]:
+        return False, [f"'{name}' is not registered"]
+    del registry["skills"][name]
+    _save_registry(skills_dir, registry)
+
+    warnings: list[str] = []
+    if routes_path and os.path.isfile(routes_path):
+        try:
+            with open(routes_path, encoding="utf-8") as fh:
+                routes = json.load(fh).get("routes", {})
+            events = [e for e, wfs in routes.items()
+                      if isinstance(wfs, list) and name in wfs]
+            if events:
+                warnings.append(
+                    f"'{name}' is still referenced in {routes_path} "
+                    f"for events: {', '.join(sorted(events))}")
+        except (OSError, ValueError):
+            pass
+    return True, warnings
+
+
+def validate_registry(skills_dir: str) -> dict:
+    """Re-validate every registered skill against the current contract (FR-008)."""
+    warnings: list[str] = []
+    registry = load_registry(skills_dir, warnings)
+    report = {
+        "contract_version_drift":
+            registry.get("contract_version") != CONTRACT_VERSION,
+        "skills": {},
+    }
+    for name, entry in registry["skills"].items():
+        skill_dir = os.path.join(skills_dir, entry.get("dir", name))
+        report["skills"][name] = validate_manifest(skill_dir)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--skills-dir", default="skills")
+    parser = argparse.ArgumentParser(
+        description="Skill registry — contract: "
+                    "specs/005-skill-contract/contracts/skill-contract.md")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_reg = sub.add_parser("register", parents=[common])
+    p_reg.add_argument("skill_dir")
+    p_reg.add_argument("--update", action="store_true")
+    p_dereg = sub.add_parser("deregister", parents=[common])
+    p_dereg.add_argument("name")
+    p_dereg.add_argument("--routes", default="config/routes.json")
+    p_res = sub.add_parser("resolve", parents=[common])
+    p_res.add_argument("name")
+    sub.add_parser("list", parents=[common])
+    sub.add_parser("validate", parents=[common])
+    args = parser.parse_args(argv)
+
+    if args.command == "register":
+        ok, messages = register_skill(args.skills_dir, args.skill_dir, args.update)
+        for m in messages:
+            print(m if ok else f"violation: {m}", file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if args.command == "deregister":
+        ok, warnings = deregister_skill(args.skills_dir, args.name, args.routes)
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        if not ok:
+            return 1
+        print(f"deregistered '{args.name}'")
+        return 0
+
+    if args.command == "resolve":
+        registry = load_registry(args.skills_dir, [])
+        entry = registry["skills"].get(args.name)
+        if entry is None:
+            print(f"'{args.name}' is not registered", file=sys.stderr)
+            return 1
+        json.dump(entry, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+
+    if args.command == "list":
+        registry = load_registry(args.skills_dir, [])
+        for name, entry in sorted(registry["skills"].items()):
+            print(f"{name} {entry.get('version', '?')} — {entry.get('description', '')}")
+        return 0
+
+    # validate
+    report = validate_registry(args.skills_dir)
+    bad = {n: v for n, v in report["skills"].items() if v}
+    if report["contract_version_drift"]:
+        print(f"warning: registry contract version differs from current "
+              f"({CONTRACT_VERSION}) — re-validating all skills", file=sys.stderr)
+    for name, violations in sorted(bad.items()):
+        for v in violations:
+            print(f"non-compliant: {name}: {v}", file=sys.stderr)
+    print(f"validated {len(report['skills'])} skill(s), "
+          f"{len(bad)} non-compliant")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
