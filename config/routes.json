@@ -1,0 +1,8 @@
+{
+  "version": "1.0",
+  "routes": {
+    "pre-commit": [],
+    "post-merge": [],
+    "pre-push": []
+  }
+}
