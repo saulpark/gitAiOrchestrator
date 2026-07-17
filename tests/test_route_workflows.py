@@ -156,16 +156,23 @@ def test_load_config_unknown_event_key_ignored(tmp_path):
 
 # --- skills invoker + CLI (Task 4) ---
 
-def _make_skill(tmp_path, name, script="#!/bin/sh\ncat > /dev/null\nexit 0\n"):
+def _make_skill(tmp_path, name, script="#!/bin/sh\ncat > /dev/null\nexit 0\n",
+                registered=True):
     d = tmp_path / "skills" / name
     d.mkdir(parents=True)
     run = d / "run"
     run.write_text(script)
     run.chmod(0o755)
+    if registered:
+        reg_path = tmp_path / "skills" / "registry.json"
+        reg = json.loads(reg_path.read_text()) if reg_path.exists() else \
+            {"contract_version": "1.0", "skills": {}}
+        reg["skills"][name] = {"dir": name, "version": "1.0.0", "description": name}
+        reg_path.write_text(json.dumps(reg))
     return d
 
 
-def test_skills_invoker_runs_executable_with_context_on_stdin(tmp_path):
+def test_skills_invoker_runs_registered_skill_with_context_on_stdin(tmp_path):
     _make_skill(tmp_path, "echoer",
                 "#!/bin/sh\ncat > \"$(dirname \"$0\")/got.json\"\nexit 0\n")
     invoker = make_skills_invoker(str(tmp_path / "skills"))
@@ -185,6 +192,21 @@ def test_skills_invoker_nonzero_exit_is_failed(tmp_path):
 def test_skills_invoker_missing_skill_unresolvable(tmp_path):
     invoker = make_skills_invoker(str(tmp_path / "skills"))
     outcome, _ = invoker("ghost", _ctx())
+    assert outcome == "unresolvable"
+
+
+def test_skills_invoker_unregistered_dir_unresolvable(tmp_path):
+    _make_skill(tmp_path, "rogue", registered=False)
+    invoker = make_skills_invoker(str(tmp_path / "skills"))
+    outcome, detail = invoker("rogue", _ctx())
+    assert outcome == "unresolvable" and "not registered" in detail
+
+
+def test_skills_invoker_registered_but_entry_point_gone(tmp_path):
+    d = _make_skill(tmp_path, "hollow")
+    (d / "run").unlink()
+    invoker = make_skills_invoker(str(tmp_path / "skills"))
+    outcome, detail = invoker("hollow", _ctx())
     assert outcome == "unresolvable"
 
 

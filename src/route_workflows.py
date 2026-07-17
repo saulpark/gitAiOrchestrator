@@ -55,9 +55,19 @@ def load_config(path: str, warnings: list[str]) -> dict:
 
 
 def make_skills_invoker(skills_dir: str):
-    """Provisional invoker (superseded by 005/006): skills/<id>/run executable."""
+    """Registry-based invoker (005): identifiers resolve through skills/registry.json."""
     def invoker(identifier: str, context: dict) -> tuple[str, str]:
-        run_path = os.path.join(skills_dir, identifier, "run")
+        try:
+            with open(os.path.join(skills_dir, "registry.json"), encoding="utf-8") as fh:
+                entries = json.load(fh).get("skills", {})
+        except FileNotFoundError:
+            entries = {}  # no registry = empty catalog: nothing is registered
+        except (OSError, ValueError) as exc:
+            return "unresolvable", f"skill registry unreadable: {exc}"
+        entry = entries.get(identifier) if isinstance(entries, dict) else None
+        if not isinstance(entry, dict):
+            return "unresolvable", f"'{identifier}' not registered"
+        run_path = os.path.join(skills_dir, entry.get("dir", identifier), "run")
         if not (os.path.isfile(run_path) and os.access(run_path, os.X_OK)):
             return "unresolvable", f"no executable at {run_path}"
         proc = subprocess.run(
