@@ -49,11 +49,13 @@ python3 src/parse_context.py | python3 src/route_workflows.py \
 | `unresolvable` | identifier could not be resolved to an executable unit | yes |
 | *(no results)* | event unconfigured/empty route → logged skip (FR-006); unroutable context → warning | see left |
 
-## Provisional Invocation Interface (superseded by 005/006)
+## Invocation Interface (superseded — see 005/006)
 
-Identifier `<id>` → `skills/<id>/run` (executable, context JSON on stdin, cwd repo root,
-60 s guard). Features 005 (skill contract) and 006 (skill executor) own this boundary;
-routers config schema and DispatchResult schema are stable regardless.
+> **v1.1 addendum (2026-07-18, feature 006)**: resolution goes through the 005 registry
+> and execution through the 006 executor. DispatchResult is now **v1.1**: adds top-level
+> `overall` and embedded `execution` (ExecutionSummary), per-result `status` and
+> `duration_ms`. See
+> [006 execution-summary contract](../../006-skill-executor/contracts/execution-summary.md).
 
 ## Non-Goals
 
