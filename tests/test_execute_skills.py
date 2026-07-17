@@ -132,3 +132,42 @@ def test_durations_present(tmp_path):
     summary = execute_plan(["quick"], CTX, _skills(tmp_path))
     assert summary["duration_ms"] >= 0
     assert all(isinstance(r["duration_ms"], int) for r in summary["results"])
+
+
+# --- CLI (Task 2) ---
+
+def _run_cli(stdin_text, *args):
+    import subprocess
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "src" / "execute_skills.py"), *args],
+        input=stdin_text, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_cli_plan_argv_context_stdin(tmp_path):
+    _make_skill(tmp_path, "solo")
+    r = _run_cli(json.dumps(CTX), "--skills-dir", _skills(tmp_path), "solo")
+    assert r.returncode == 0
+    summary = json.loads(r.stdout)
+    assert summary["overall"] == "success"
+    assert summary["results"][0]["skill"] == "solo"
+
+
+def test_cli_all_failures_still_exit_zero(tmp_path):
+    _make_skill(tmp_path, "bad", "#!/bin/sh\nexit 1\n")
+    r = _run_cli(json.dumps(CTX), "--skills-dir", _skills(tmp_path), "bad")
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["overall"] == "failure"
+
+
+def test_cli_garbage_stdin_exit_zero(tmp_path):
+    r = _run_cli("{nope", "--skills-dir", _skills(tmp_path), "anything")
+    assert r.returncode == 0
+    summary = json.loads(r.stdout)
+    assert summary["overall"] in ("empty", "failure")
+
+
+def test_cli_empty_plan(tmp_path):
+    r = _run_cli(json.dumps(CTX), "--skills-dir", _skills(tmp_path))
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["overall"] == "empty"

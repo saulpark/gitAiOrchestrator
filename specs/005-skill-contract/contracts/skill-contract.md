@@ -1,4 +1,4 @@
-# Skill Contract — v1.0
+# Skill Contract — v1.1
 
 **The standalone, authoritative definition of what a skill must declare and exhibit.**
 Read this before writing a skill; a compliant skill registers on the first attempt (SC-001).
@@ -31,6 +31,12 @@ python3 src/skill_registry.py register skills/<dir>
 | `input` | string | exactly `"hook-context@1.0"` — skills accept the standard context, nothing else |
 | `output` | string | exactly `"skill-result@1.0"` |
 | `behaviors` | object | `non_blocking: true` (mandatory) and `idempotent: <bool>` — declared by the author, trusted at registration |
+
+### Optional manifest fields (v1.1)
+
+| Field | Type | Rule |
+|-------|------|------|
+| `time_budget_seconds` | number | execution time budget enforced by the executor (006); `0 < n ≤ 600`; absent → system default (30 s) |
 
 Example:
 
@@ -91,6 +97,7 @@ python3 src/skill_registry.py validate                       # re-check all skil
 
 ## Versioning
 
-This contract is versioned (`1.0`). Adding a required field is a minor bump + `validate`
+This contract is versioned (`1.1` — v1.1 added optional `time_budget_seconds` for the
+006 executor). Adding a required field is a minor bump + `validate`
 run to surface newly non-compliant skills (SC-005); removing/redefining a field is a major
 bump. The registry records the contract version it was last written under.

@@ -102,8 +102,20 @@ def test_all_violations_reported_in_one_pass(tmp_path):
             "behaviors", "entry-point"} <= rules
 
 
-def test_contract_version_is_one_zero():
-    assert CONTRACT_VERSION == "1.0"
+def test_contract_version_is_one_one():
+    assert CONTRACT_VERSION == "1.1"
+
+
+def test_invalid_time_budget_is_violation(tmp_path):
+    m = {**GOOD_MANIFEST, "time_budget_seconds": -5}
+    d = _make_skill(tmp_path, m, dirname="bad-budget")
+    assert "time-budget" in _violation_rules(validate_manifest(str(d)))
+
+
+def test_valid_time_budget_accepted(tmp_path):
+    m = {**GOOD_MANIFEST, "time_budget_seconds": 12}
+    d = _make_skill(tmp_path, m, dirname="good-budget")
+    assert validate_manifest(str(d)) == []
 
 
 # --- registry operations (Task 2) ---

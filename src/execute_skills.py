@@ -120,3 +120,41 @@ def execute_plan(plan: list[str], context: dict, skills_dir: str,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "results": results,
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Execute an ordered plan of registered skills")
+    parser.add_argument("plan", nargs="*", help="skill identifiers, in order")
+    parser.add_argument("--skills-dir", default="skills")
+    parser.add_argument("--default-budget", type=float,
+                        default=DEFAULT_BUDGET_SECONDS)
+    args = parser.parse_args(argv)
+
+    try:
+        context = json.load(sys.stdin)
+        if not isinstance(context, dict):
+            raise ValueError("context must be a JSON object")
+        plan = list(args.plan)
+    except Exception as exc:  # FR-007: never abort the git operation
+        print(f"[executor warning] unreadable context on stdin: {exc}",
+              file=sys.stderr)
+        context, plan = {"event": None}, []
+
+    try:
+        summary = execute_plan(plan, context, args.skills_dir,
+                               args.default_budget)
+    except Exception as exc:
+        summary = {"schema_version": SUMMARY_SCHEMA_VERSION,
+                   "event": context.get("event"), "overall": "failure",
+                   "duration_ms": 0,
+                   "results": [{"skill": s, "status": "failure", "duration_ms": 0,
+                                "detail": f"executor failure: {exc}", "result": None}
+                               for s in plan]}
+    json.dump(summary, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
