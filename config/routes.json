@@ -1,8 +1,10 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "routes": {
     "pre-commit": [],
     "post-merge": [],
     "pre-push": []
-  }
+  },
+  "outcomes": {},
+  "run_retention": 50
 }
