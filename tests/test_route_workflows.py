@@ -215,6 +215,84 @@ def test_cli_routes_context_from_stdin_exit_zero(tmp_path):
     assert out["execution"]["results"] == []
 
 
+def test_load_config_accepts_outcomes_and_retention(tmp_path):
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps({
+        "version": "1.1", "routes": {"pre-commit": ["a"]},
+        "outcomes": {"a": {"on_failure": "block"}}, "run_retention": 7}))
+    warnings = []
+    cfg = load_config(str(p), warnings)
+    assert cfg["outcomes"] == {"a": {"on_failure": "block"}}
+    assert cfg["run_retention"] == 7
+    assert warnings == []
+
+
+def test_load_config_bad_outcomes_shape_ignored_with_warning(tmp_path):
+    p = tmp_path / "routes.json"
+    p.write_text('{"version": "1.1", "routes": {}, "outcomes": ["nope"], "run_retention": "many"}')
+    warnings = []
+    cfg = load_config(str(p), warnings)
+    assert cfg["outcomes"] == {} and cfg["run_retention"] == 50
+    assert any("outcomes" in w for w in warnings)
+    assert any("run_retention" in w for w in warnings)
+
+
+def _outcome_cli(tmp_path, rule, event="pre-commit", skill_script="#!/bin/sh\nexit 1\n"):
+    _make_skill(tmp_path, "gate", script=skill_script)
+    cfg = tmp_path / "routes.json"
+    outcomes = {"gate": rule} if rule else {}
+    cfg.write_text(json.dumps({"version": "1.1", "routes": {event: ["gate"]},
+                               "outcomes": outcomes}))
+    runs = tmp_path / "runs"
+    return _run_cli(json.dumps(_ctx(event)), "--config", str(cfg),
+                    "--skills-dir", str(tmp_path / "skills"),
+                    "--runs-dir", str(runs)), runs
+
+
+def test_cli_block_rule_exits_ten_with_message(tmp_path):
+    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"})
+    assert r.returncode == 10
+    assert "[hook blocked]" in r.stderr and "gate" in r.stderr
+    out = json.loads(r.stdout)
+    assert out["final_outcome"] == "block"
+    assert out["run_record"] and (runs / Path(out["run_record"]).name).exists()
+
+
+def test_cli_default_warn_exits_zero_with_warning(tmp_path):
+    r, runs = _outcome_cli(tmp_path, None)
+    assert r.returncode == 0
+    assert "[router warning]" in r.stderr
+    assert json.loads(r.stdout)["final_outcome"] == "warn"
+
+
+def test_cli_skip_rule_silent_but_recorded(tmp_path):
+    r, runs = _outcome_cli(tmp_path, {"on_failure": "skip"})
+    assert r.returncode == 0
+    assert "[router warning]" not in r.stderr and "[hook blocked]" not in r.stderr
+    out = json.loads(r.stdout)
+    assert out["final_outcome"] == "none"
+    rec = json.loads(next(runs.glob("*.json")).read_text())
+    assert rec["results"][0]["outcome"] == "skip"
+
+
+def test_cli_post_merge_block_downgraded(tmp_path):
+    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"}, event="post-merge")
+    assert r.returncode == 0
+    assert "[hook blocked]" not in r.stderr and "[router warning]" in r.stderr
+    out = json.loads(r.stdout)
+    assert out["final_outcome"] == "warn"
+
+
+def test_cli_success_writes_record_no_messages(tmp_path):
+    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"},
+                           skill_script=f"#!/bin/sh\ncat > /dev/null\nprintf %s '{OK_RESULT}'\n")
+    assert r.returncode == 0
+    assert r.stderr.strip() == ""
+    out = json.loads(r.stdout)
+    assert out["final_outcome"] == "none"
+    assert len(list(runs.glob("*.json"))) == 1
+
+
 def test_cli_dispatch_via_executor_v11_shape(tmp_path):
     _make_skill(tmp_path, "good")
     _make_skill(tmp_path, "bad", script="#!/bin/sh\nexit 1\n")

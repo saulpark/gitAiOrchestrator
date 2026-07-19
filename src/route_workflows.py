@@ -18,8 +18,16 @@ import sys
 from datetime import datetime, timezone
 
 from execute_skills import execute_plan
+from run_records import (
+    BLOCK_EXIT_CODE,
+    DEFAULT_RETENTION,
+    DEFAULT_RUNS_DIR,
+    build_run_record,
+    evaluate_outcomes,
+    write_run_record,
+)
 
-RESULT_SCHEMA_VERSION = "1.1"
+RESULT_SCHEMA_VERSION = "1.2"
 OUTCOMES = ("invoked", "unresolvable", "failed")
 VALID_EVENTS = ("pre-commit", "post-merge", "pre-push")
 DEFAULT_CONFIG = "config/routes.json"
@@ -29,7 +37,8 @@ _STATUS_TO_OUTCOME = {"success": "invoked", "skipped": "unresolvable",
 
 
 def load_config(path: str, warnings: list[str]) -> dict:
-    empty = {"version": "1.0", "routes": {}}
+    empty = {"version": "1.0", "routes": {}, "outcomes": {},
+             "run_retention": DEFAULT_RETENTION}
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -55,7 +64,24 @@ def load_config(path: str, warnings: list[str]) -> dict:
         else:
             warnings.append(f"routing config: route for '{event}' must be a list of strings — treating as empty")
             clean[event] = []
-    return {"version": raw.get("version", "1.0"), "routes": clean}
+
+    outcomes = raw.get("outcomes", {})
+    if not isinstance(outcomes, dict) or not all(
+            isinstance(v, dict) for v in outcomes.values()):
+        if outcomes != {}:
+            warnings.append("routing config: 'outcomes' must be an object of "
+                            "rule objects — ignoring")
+        outcomes = {}
+
+    retention = raw.get("run_retention", DEFAULT_RETENTION)
+    if not isinstance(retention, int) or isinstance(retention, bool) or retention < 1:
+        if retention != DEFAULT_RETENTION:
+            warnings.append("routing config: 'run_retention' must be a positive "
+                            "integer — using default")
+        retention = DEFAULT_RETENTION
+
+    return {"version": raw.get("version", "1.0"), "routes": clean,
+            "outcomes": outcomes, "run_retention": retention}
 
 
 def select_plan(context: dict, config: dict, warnings: list[str]) -> list[str]:
@@ -103,6 +129,7 @@ def _log_summary(log_path: str, result: dict) -> None:
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"[{stamp}] route event={result['event']} {summary} "
                      f"overall={result.get('overall', 'n/a')} "
+                     f"outcome={result.get('final_outcome', 'n/a')} "
                      f"warnings={len(result['warnings'])}\n")
     except OSError:
         pass  # logging must never break routing
@@ -113,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--log", default=None)
     parser.add_argument("--skills-dir", default=DEFAULT_SKILLS_DIR)
+    parser.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR)
     args = parser.parse_args(argv)
 
     warnings: list[str] = []
@@ -125,25 +153,45 @@ def main(argv: list[str] | None = None) -> int:
         context = {"event": None}
 
     config = load_config(args.config, warnings)
+    exit_code = 0
     try:
         plan = select_plan(context, config, warnings)
         summary = execute_plan(plan, context, args.skills_dir)
+        evaluation = evaluate_outcomes(summary, config["outcomes"],
+                                       context.get("event"))
+        record = build_run_record(context, plan, summary, evaluation, warnings)
+        record_path = write_run_record(args.runs_dir, record,
+                                       config["run_retention"])
+
         results = []
-        for r in summary["results"]:
+        for r in evaluation["results"]:
             outcome = _STATUS_TO_OUTCOME.get(r["status"], "failed")
-            if outcome != "invoked":
+            if r["outcome"] == "warn":
                 warnings.append(f"workflow '{r['skill']}' {outcome}: {r['detail']}")
             results.append({"workflow": r["skill"], "outcome": outcome,
                             "status": r["status"], "detail": r["detail"],
                             "duration_ms": r["duration_ms"]})
+
+        blocking = [r for r in evaluation["results"] if r["outcome"] == "block"]
+        for b in blocking:
+            print(f"[hook blocked] skill '{b['skill']}': {b['detail']}",
+                  file=sys.stderr)
+        if blocking:
+            exit_code = BLOCK_EXIT_CODE
+
         result = {"schema_version": RESULT_SCHEMA_VERSION,
                   "event": context.get("event"), "overall": summary["overall"],
-                  "results": results, "execution": summary, "warnings": []}
-    except Exception as exc:  # SC-004: routing can never abort the git operation
+                  "final_outcome": evaluation["final_outcome"],
+                  "results": results, "outcomes": evaluation["results"],
+                  "execution": summary, "run_record": record_path,
+                  "warnings": evaluation.get("notes", [])}
+    except Exception as exc:  # SC-004: only a matched block rule may abort git
         result = {"schema_version": RESULT_SCHEMA_VERSION,
                   "event": context.get("event"), "overall": "failure",
-                  "results": [], "execution": None,
+                  "final_outcome": "warn", "results": [], "outcomes": [],
+                  "execution": None, "run_record": None,
                   "warnings": [f"router failure: {exc}"]}
+        exit_code = 0
     result["warnings"] = warnings + result["warnings"]
 
     for w in result["warnings"]:
@@ -152,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         _log_summary(args.log, result)
     json.dump(result, sys.stdout)
     sys.stdout.write("\n")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

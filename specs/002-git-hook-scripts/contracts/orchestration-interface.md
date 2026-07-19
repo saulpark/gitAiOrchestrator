@@ -78,9 +78,13 @@ disown $!
 | Exit Code | Meaning for hook caller |
 |-----------|------------------------|
 | `0` | Orchestration succeeded |
-| non-zero | Orchestration failed — hook emits warning, still exits 0 |
+| `10` | **Block** (v1.2, feature 008): a configured outcome rule matched — hook exits 1, aborting the git operation |
+| other non-zero | Orchestration failed — hook emits warning, still exits 0 |
 
-**Hook scripts MUST always exit 0 regardless of orchestration exit code.**
+> **v1.2 addendum (2026-07-19, feature 008)**: the original "hooks always exit 0" rule is
+> refined — exit 10 is a reserved, deliberate block signal handled by `_finish_hook` in
+> `scripts/lib.sh`. Crashes and timeouts still never block. See
+> [008 run-record contract](../../008-run-observability/contracts/run-record.md).
 
 ---
 
