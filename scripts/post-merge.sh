@@ -8,6 +8,4 @@ HOOK_FILES=$(git diff-tree -r --name-only --no-commit-id ORIG_HEAD HEAD 2>/dev/n
 export HOOK_EVENT HOOK_BRANCH HOOK_FILES
 
 _run_with_timeout "$(_hook_root)/scripts/orchestrate.sh"
-EXIT=$?
-[ "$EXIT" -ne 0 ] && printf '[hook warning] orchestration failed (exit %d)\n' "$EXIT" >&2
-exit 0
+_finish_hook $?
