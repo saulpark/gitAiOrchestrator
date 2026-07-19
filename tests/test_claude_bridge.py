@@ -162,3 +162,85 @@ def test_invoke_bad_request_missing_context():
     result = invoke({"schema_version": "1.0", "task": "x"},
                     DEFAULT_CONFIG, _fake_runner([]))
     assert result["status"] == "bad-request" and "context" in result["error"]
+
+
+# --- availability + CLI (Task 2) ---
+
+def test_invoke_unavailable_when_command_missing():
+    cfg = {**DEFAULT_CONFIG, "claude_command": "claude-not-on-path-xyz"}
+    result = invoke(_request(), cfg)  # no runner injected → which() gate
+    assert result["status"] == "unavailable"
+    assert "claude-not-on-path-xyz" in result["error"]
+
+
+FAKE_CLAUDE_OK = """#!/bin/sh
+printf '%s\\n' "$@" > "$(dirname "$0")/argv.txt"
+printf '%s' '{"result": "fake says hi", "is_error": false}'
+"""
+
+
+def _write_fake_claude(tmp_path, script=FAKE_CLAUDE_OK):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "claude"
+    fake.write_text(script)
+    fake.chmod(0o755)
+    return bin_dir
+
+
+def _run_cli(tmp_path, stdin_text, config=None, path_prefix=None):
+    import os
+    cfg_path = tmp_path / "bridge.json"
+    cfg_path.write_text(json.dumps(config or DEFAULT_CONFIG))
+    env = dict(os.environ)
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}:{env['PATH']}"
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "src" / "claude_bridge.py"),
+         "--config", str(cfg_path)],
+        input=stdin_text, capture_output=True, text=True, timeout=30, env=env,
+    )
+
+
+def test_cli_ok_with_fake_claude(tmp_path):
+    bin_dir = _write_fake_claude(tmp_path)
+    r = _run_cli(tmp_path, json.dumps(_request()), path_prefix=str(bin_dir))
+    assert r.returncode == 0
+    result = json.loads(r.stdout)
+    assert result["status"] == "ok"
+    assert result["output"]["result"] == "fake says hi"
+    argv = (tmp_path / "bin" / "argv.txt").read_text()
+    assert "-p" in argv and "src/a.py" in argv and "disableAllHooks" in argv
+
+
+def test_cli_fake_claude_failure_exit_zero(tmp_path):
+    bin_dir = _write_fake_claude(tmp_path, "#!/bin/sh\necho nope >&2\nexit 7\n")
+    r = _run_cli(tmp_path, json.dumps(_request()), path_prefix=str(bin_dir))
+    assert r.returncode == 0
+    result = json.loads(r.stdout)
+    assert result["status"] == "error" and "7" in result["error"]
+
+
+def test_cli_fake_claude_timeout(tmp_path):
+    bin_dir = _write_fake_claude(tmp_path, "#!/bin/sh\nsleep 10\n")
+    r = _run_cli(tmp_path,
+                 json.dumps(_request(options={"timeout_seconds": 1})),
+                 path_prefix=str(bin_dir))
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["status"] == "timeout"
+
+
+def test_cli_garbage_stdin_bad_request(tmp_path):
+    r = _run_cli(tmp_path, "{nope")
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["status"] == "bad-request"
+
+
+def test_cli_hooks_enabled_omits_settings_override(tmp_path):
+    bin_dir = _write_fake_claude(tmp_path)
+    r = _run_cli(tmp_path, json.dumps(_request()),
+                 config={**DEFAULT_CONFIG, "hooks_enabled": True},
+                 path_prefix=str(bin_dir))
+    assert json.loads(r.stdout)["status"] == "ok"
+    argv = (tmp_path / "bin" / "argv.txt").read_text()
+    assert "disableAllHooks" not in argv
