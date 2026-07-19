@@ -27,6 +27,10 @@ invocation (FR-007), no reinstall.
 - Missing file / malformed JSON → treated as empty config, `[router warning]` emitted,
   git operation unaffected (FR-008)
 
+> **Schema v1.1 (2026-07-19, feature 008)**: optional top-level `outcomes`
+> (skill → `{"on_failure": "block"|"warn"|"skip"}`) and `run_retention` (int, default 50).
+> See [008 run-record contract](../../008-run-observability/contracts/run-record.md).
+
 ## Router CLI
 
 ```sh
