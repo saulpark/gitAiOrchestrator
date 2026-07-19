@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Workflow router (feature 004).
+"""Workflow router (feature 004; execution delegated to 006).
 
 Reads a hook context (003 schema) on stdin, loads config/routes.json fresh on
-every invocation, and dispatches each mapped workflow identifier through an
-invoker. Emits a DispatchResult JSON on stdout, warnings on stderr, and always
-exits 0 so routing can never abort the triggering git operation. Contract:
-specs/004-workflow-router/contracts/routing-config.md
+every invocation, selects the execution plan for the event, and hands it to
+the skill executor (execute_skills). Emits a DispatchResult v1.1 JSON on
+stdout (embedding the ExecutionSummary), warnings on stderr, and always exits
+0 so routing can never abort the triggering git operation. Contracts:
+specs/004-workflow-router/contracts/routing-config.md,
+specs/006-skill-executor/contracts/execution-summary.md
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 
-RESULT_SCHEMA_VERSION = "1.0"
+from execute_skills import execute_plan
+
+RESULT_SCHEMA_VERSION = "1.1"
 OUTCOMES = ("invoked", "unresolvable", "failed")
 VALID_EVENTS = ("pre-commit", "post-merge", "pre-push")
 DEFAULT_CONFIG = "config/routes.json"
 DEFAULT_SKILLS_DIR = "skills"
-SKILL_GUARD_SECONDS = 60
+_STATUS_TO_OUTCOME = {"success": "invoked", "skipped": "unresolvable",
+                      "failure": "failed", "timeout": "failed"}
 
 
 def load_config(path: str, warnings: list[str]) -> dict:
@@ -54,42 +58,20 @@ def load_config(path: str, warnings: list[str]) -> dict:
     return {"version": raw.get("version", "1.0"), "routes": clean}
 
 
-def make_skills_invoker(skills_dir: str):
-    """Registry-based invoker (005): identifiers resolve through skills/registry.json."""
-    def invoker(identifier: str, context: dict) -> tuple[str, str]:
-        try:
-            with open(os.path.join(skills_dir, "registry.json"), encoding="utf-8") as fh:
-                entries = json.load(fh).get("skills", {})
-        except FileNotFoundError:
-            entries = {}  # no registry = empty catalog: nothing is registered
-        except (OSError, ValueError) as exc:
-            return "unresolvable", f"skill registry unreadable: {exc}"
-        entry = entries.get(identifier) if isinstance(entries, dict) else None
-        if not isinstance(entry, dict):
-            return "unresolvable", f"'{identifier}' not registered"
-        run_path = os.path.join(skills_dir, entry.get("dir", identifier), "run")
-        if not (os.path.isfile(run_path) and os.access(run_path, os.X_OK)):
-            return "unresolvable", f"no executable at {run_path}"
-        proc = subprocess.run(
-            [run_path], input=json.dumps(context), text=True,
-            capture_output=True, timeout=SKILL_GUARD_SECONDS,
-        )
-        if proc.returncode != 0:
-            return "failed", f"exit {proc.returncode}: {proc.stderr.strip()[:200]}"
-        return "invoked", ""
-    return invoker
+def select_plan(context: dict, config: dict, warnings: list[str]) -> list[str]:
+    """Extract the ordered execution plan for the context's event (FR-006)."""
+    event = context.get("event")
+    if event not in VALID_EVENTS:
+        warnings.append(f"cannot route context: event is {event!r}")
+        return []
+    return config.get("routes", {}).get(event, [])
 
 
 def route(context: dict, config: dict, invoker) -> dict:
     warnings: list[str] = []
     results: list[dict] = []
-
     event = context.get("event")
-    if event not in VALID_EVENTS:
-        warnings.append(f"cannot route context: event is {event!r}")
-        workflows: list[str] = []
-    else:
-        workflows = config.get("routes", {}).get(event, [])
+    workflows = select_plan(context, config, warnings)
 
     for identifier in workflows:
         try:
@@ -120,6 +102,7 @@ def _log_summary(log_path: str, result: dict) -> None:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"[{stamp}] route event={result['event']} {summary} "
+                     f"overall={result.get('overall', 'n/a')} "
                      f"warnings={len(result['warnings'])}\n")
     except OSError:
         pass  # logging must never break routing
@@ -143,10 +126,23 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config, warnings)
     try:
-        result = route(context, config, make_skills_invoker(args.skills_dir))
+        plan = select_plan(context, config, warnings)
+        summary = execute_plan(plan, context, args.skills_dir)
+        results = []
+        for r in summary["results"]:
+            outcome = _STATUS_TO_OUTCOME.get(r["status"], "failed")
+            if outcome != "invoked":
+                warnings.append(f"workflow '{r['skill']}' {outcome}: {r['detail']}")
+            results.append({"workflow": r["skill"], "outcome": outcome,
+                            "status": r["status"], "detail": r["detail"],
+                            "duration_ms": r["duration_ms"]})
+        result = {"schema_version": RESULT_SCHEMA_VERSION,
+                  "event": context.get("event"), "overall": summary["overall"],
+                  "results": results, "execution": summary, "warnings": []}
     except Exception as exc:  # SC-004: routing can never abort the git operation
         result = {"schema_version": RESULT_SCHEMA_VERSION,
-                  "event": context.get("event"), "results": [],
+                  "event": context.get("event"), "overall": "failure",
+                  "results": [], "execution": None,
                   "warnings": [f"router failure: {exc}"]}
     result["warnings"] = warnings + result["warnings"]
 

@@ -14,7 +14,8 @@ import os
 import re
 import sys
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
+MAX_TIME_BUDGET_SECONDS = 600
 RESERVED_NAMES = frozenset({"registry", "contract", "skills"})
 REQUIRED_INPUT = "hook-context@1.0"
 REQUIRED_OUTPUT = "skill-result@1.0"
@@ -64,6 +65,14 @@ def validate_manifest(skill_dir: str) -> list[str]:
             or not isinstance(behaviors.get("idempotent"), bool)):
         violations.append(
             "behaviors: required object with non_blocking=true and boolean idempotent")
+
+    budget = manifest.get("time_budget_seconds")
+    if budget is not None and not (
+            isinstance(budget, (int, float)) and not isinstance(budget, bool)
+            and 0 < budget <= MAX_TIME_BUDGET_SECONDS):
+        violations.append(
+            f"time-budget: time_budget_seconds must be a number in "
+            f"(0, {MAX_TIME_BUDGET_SECONDS}] when present")
 
     run_path = os.path.join(skill_dir, "run")
     if not (os.path.isfile(run_path) and os.access(run_path, os.X_OK)):

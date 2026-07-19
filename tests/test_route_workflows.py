@@ -11,8 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from route_workflows import (  # noqa: E402
     RESULT_SCHEMA_VERSION,
     load_config,
-    make_skills_invoker,
     route,
+    select_plan,
 )
 
 
@@ -156,7 +156,12 @@ def test_load_config_unknown_event_key_ignored(tmp_path):
 
 # --- skills invoker + CLI (Task 4) ---
 
-def _make_skill(tmp_path, name, script="#!/bin/sh\ncat > /dev/null\nexit 0\n",
+OK_RESULT = ('{"schema_version": "1.0", "skill": "x", "status": "ok", '
+             '"summary": "done", "details": {}}')
+
+
+def _make_skill(tmp_path, name,
+                script=f"#!/bin/sh\ncat > /dev/null\nprintf %s '{OK_RESULT}'\n",
                 registered=True):
     d = tmp_path / "skills" / name
     d.mkdir(parents=True)
@@ -166,48 +171,28 @@ def _make_skill(tmp_path, name, script="#!/bin/sh\ncat > /dev/null\nexit 0\n",
     if registered:
         reg_path = tmp_path / "skills" / "registry.json"
         reg = json.loads(reg_path.read_text()) if reg_path.exists() else \
-            {"contract_version": "1.0", "skills": {}}
+            {"contract_version": "1.1", "skills": {}}
         reg["skills"][name] = {"dir": name, "version": "1.0.0", "description": name}
         reg_path.write_text(json.dumps(reg))
     return d
 
 
-def test_skills_invoker_runs_registered_skill_with_context_on_stdin(tmp_path):
-    _make_skill(tmp_path, "echoer",
-                "#!/bin/sh\ncat > \"$(dirname \"$0\")/got.json\"\nexit 0\n")
-    invoker = make_skills_invoker(str(tmp_path / "skills"))
-    outcome, detail = invoker("echoer", _ctx())
-    assert outcome == "invoked"
-    got = json.loads((tmp_path / "skills" / "echoer" / "got.json").read_text())
-    assert got["event"] == "pre-commit"
+def test_select_plan_returns_configured_order():
+    warnings = []
+    plan = select_plan(_ctx(), _config(pre_commit=["b", "a"]), warnings)
+    assert plan == ["b", "a"] and warnings == []
 
 
-def test_skills_invoker_nonzero_exit_is_failed(tmp_path):
-    _make_skill(tmp_path, "broken", "#!/bin/sh\nexit 3\n")
-    invoker = make_skills_invoker(str(tmp_path / "skills"))
-    outcome, detail = invoker("broken", _ctx())
-    assert outcome == "failed" and "3" in detail
+def test_select_plan_unroutable_context_warns():
+    warnings = []
+    plan = select_plan({"event": None}, _config(pre_commit=["a"]), warnings)
+    assert plan == [] and any("event" in w for w in warnings)
 
 
-def test_skills_invoker_missing_skill_unresolvable(tmp_path):
-    invoker = make_skills_invoker(str(tmp_path / "skills"))
-    outcome, _ = invoker("ghost", _ctx())
-    assert outcome == "unresolvable"
-
-
-def test_skills_invoker_unregistered_dir_unresolvable(tmp_path):
-    _make_skill(tmp_path, "rogue", registered=False)
-    invoker = make_skills_invoker(str(tmp_path / "skills"))
-    outcome, detail = invoker("rogue", _ctx())
-    assert outcome == "unresolvable" and "not registered" in detail
-
-
-def test_skills_invoker_registered_but_entry_point_gone(tmp_path):
-    d = _make_skill(tmp_path, "hollow")
-    (d / "run").unlink()
-    invoker = make_skills_invoker(str(tmp_path / "skills"))
-    outcome, detail = invoker("hollow", _ctx())
-    assert outcome == "unresolvable"
+def test_select_plan_unconfigured_event_empty_no_warning():
+    warnings = []
+    plan = select_plan(_ctx("pre-push"), _config(pre_commit=["a"]), warnings)
+    assert plan == [] and warnings == []
 
 
 def _run_cli(stdin_text, *args, cwd=None):
@@ -225,6 +210,31 @@ def test_cli_routes_context_from_stdin_exit_zero(tmp_path):
     assert r.returncode == 0
     out = json.loads(r.stdout)
     assert out["event"] == "pre-commit" and out["results"] == []
+    assert out["schema_version"] == RESULT_SCHEMA_VERSION
+    assert out["overall"] == "empty"
+    assert out["execution"]["results"] == []
+
+
+def test_cli_dispatch_via_executor_v11_shape(tmp_path):
+    _make_skill(tmp_path, "good")
+    _make_skill(tmp_path, "bad", script="#!/bin/sh\nexit 1\n")
+    cfg = tmp_path / "routes.json"
+    cfg.write_text('{"version": "1.0", "routes": {"pre-commit": ["good", "bad", "ghost"]}}')
+    r = _run_cli(json.dumps(_ctx()), "--config", str(cfg),
+                 "--skills-dir", str(tmp_path / "skills"))
+    assert r.returncode == 0
+    out = json.loads(r.stdout)
+    entries = {e["workflow"]: e for e in out["results"]}
+    assert entries["good"]["outcome"] == "invoked"
+    assert entries["good"]["status"] == "success"
+    assert entries["bad"]["outcome"] == "failed"
+    assert entries["bad"]["status"] == "failure"
+    assert entries["ghost"]["outcome"] == "unresolvable"
+    assert entries["ghost"]["status"] == "skipped"
+    assert all(isinstance(e["duration_ms"], int) for e in out["results"])
+    assert out["overall"] == "partial-failure"
+    assert [e["skill"] for e in out["execution"]["results"]] == ["good", "bad", "ghost"]
+    assert "ghost" in r.stderr and "bad" in r.stderr  # warnings still visible
 
 
 def test_cli_garbage_stdin_exit_zero_with_warning():
