@@ -15,19 +15,27 @@ import re
 import sys
 from collections.abc import Mapping
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.0"          # bumped only on a breaking context-schema change
 VALID_EVENTS = ("pre-commit", "post-merge", "pre-push")
-_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")  # SHA-1 (40) or SHA-256 (64)
 
 
 def _normalize_paths(raw: str, repo_root: str, errors: list[str]) -> list[str]:
-    paths = set()
+    """Newline-separated paths -> sorted, de-duplicated, repo-relative list.
+
+    Hooks may hand us absolute paths (or the same path twice, e.g. a file
+    touched by several pushed commits). Downstream components compare paths as
+    plain strings, so they must be normalized here, exactly once.
+    """
+    paths = set()  # a set: the same file may be reported by several commits
     for line in raw.splitlines():
         p = line.strip()
         if not p:
             continue
         if os.path.isabs(p):
             rel = os.path.relpath(p, repo_root)
+            # A relative path starting with ".." escapes the repo — never pass
+            # it on; skills are only ever allowed to see in-repo files.
             if rel == ".." or rel.startswith(".." + os.sep):
                 errors.append(f"path outside repository dropped: {p}")
                 continue
@@ -37,7 +45,12 @@ def _normalize_paths(raw: str, repo_root: str, errors: list[str]) -> list[str]:
 
 
 def _parse_commits(raw: str, errors: list[str]) -> list[str]:
-    commits: list[str] = []
+    """Validate commit ids, preserving push order (unlike files, order matters).
+
+    Anything that is not a full hex SHA is dropped with a recorded error rather
+    than passed through — skills must never receive an unusable commit id.
+    """
+    commits: list[str] = []  # a list, not a set: push order is meaningful
     for line in raw.splitlines():
         tok = line.strip()
         if not tok:
@@ -51,8 +64,16 @@ def _parse_commits(raw: str, errors: list[str]) -> list[str]:
 
 
 def parse_context(env: Mapping[str, str], repo_root: str) -> dict:
-    unavailable: list[str] = []
-    errors: list[str] = []
+    """Build the context document from the hook environment.
+
+    Nothing here raises or exits non-zero. Every problem is recorded instead:
+    the affected field is named in "unavailable", the reason is appended to
+    "errors", and "partial" flips to true. Consumers (router, skills) can then
+    decide for themselves whether a partial context is good enough, rather than
+    being handed a silently truncated one.
+    """
+    unavailable: list[str] = []  # field names we could NOT determine
+    errors: list[str] = []       # human-readable reasons, one per problem
 
     event = env.get("HOOK_EVENT")
     if not event or event not in VALID_EVENTS:
@@ -76,6 +97,8 @@ def parse_context(env: Mapping[str, str], repo_root: str) -> dict:
     else:
         files = _normalize_paths(raw_files, repo_root, errors)
 
+    # HOOK_COMMITS is only set by pre-push (003 contract v1.1); its absence is
+    # normal for the other two events and only an error for pre-push.
     raw_commits = env.get("HOOK_COMMITS")
     if event == "pre-push" and raw_commits is None:
         errors.append("HOOK_COMMITS not set for pre-push")
@@ -97,9 +120,12 @@ def parse_context(env: Mapping[str, str], repo_root: str) -> dict:
 
 
 def main() -> int:
+    """CLI: env -> context JSON on stdout. Exit code is always 0."""
     try:
         context = parse_context(os.environ, os.getcwd())
     except Exception as exc:  # SC-005: never abort the triggering git operation
+        # Last-resort context: fully partial, but still schema-valid, so the
+        # router downstream can parse it instead of choking on empty stdin.
         context = {
             "schema_version": SCHEMA_VERSION,
             "event": None,
