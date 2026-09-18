@@ -14,12 +14,15 @@ import os
 import re
 import sys
 
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.1"   # 1.0 + optional time_budget_seconds (feature 006)
 MAX_TIME_BUDGET_SECONDS = 600
+# Names that would collide with registry/tooling concepts on disk or in the CLI.
 RESERVED_NAMES = frozenset({"registry", "contract", "skills"})
+# Pinned schema versions: a skill must declare exactly the context it is handed
+# and the result shape the executor knows how to read.
 REQUIRED_INPUT = "hook-context@1.0"
 REQUIRED_OUTPUT = "skill-result@1.0"
-_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # safe as a dir/CLI token
 _SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
 
 
@@ -28,6 +31,10 @@ def validate_manifest(skill_dir: str) -> list[str]:
 
     Returns a complete list of violations in one pass (SC-003), each as
     "<rule-name>: <explanation>". Empty list = compliant.
+
+    One pass, not fail-fast: an author fixing a manifest should see everything
+    that is wrong with it at once. The only early return is an unreadable
+    manifest, where no further rule can be meaningfully checked.
     """
     violations: list[str] = []
     manifest_path = os.path.join(skill_dir, "skill.json")
@@ -59,6 +66,9 @@ def validate_manifest(skill_dir: str) -> list[str]:
     if manifest.get("output") != REQUIRED_OUTPUT:
         violations.append(f"output: must be exactly '{REQUIRED_OUTPUT}'")
 
+    # non_blocking must be literally true: a skill declares up front that it
+    # cannot hang the git operation. Blocking is the operator's decision, made
+    # in routes.json (feature 008), never the skill's.
     behaviors = manifest.get("behaviors")
     if (not isinstance(behaviors, dict)
             or behaviors.get("non_blocking") is not True
@@ -66,6 +76,8 @@ def validate_manifest(skill_dir: str) -> list[str]:
         violations.append(
             "behaviors: required object with non_blocking=true and boolean idempotent")
 
+    # Optional (contract 1.1). isinstance(True, int) is True in Python, so
+    # bools are excluded explicitly — "time_budget_seconds": true is nonsense.
     budget = manifest.get("time_budget_seconds")
     if budget is not None and not (
             isinstance(budget, (int, float)) and not isinstance(budget, bool)
@@ -74,6 +86,8 @@ def validate_manifest(skill_dir: str) -> list[str]:
             f"time-budget: time_budget_seconds must be a number in "
             f"(0, {MAX_TIME_BUDGET_SECONDS}] when present")
 
+    # The one entry point the executor knows how to call. Executability is part
+    # of the contract: a non-executable run file is a broken skill, not a skill.
     run_path = os.path.join(skill_dir, "run")
     if not (os.path.isfile(run_path) and os.access(run_path, os.X_OK)):
         violations.append(f"entry-point: executable 'run' missing at {run_path}")
@@ -86,6 +100,11 @@ def _registry_path(skills_dir: str) -> str:
 
 
 def load_registry(skills_dir: str, warnings: list[str]) -> dict:
+    """Read skills/registry.json, degrading to an empty catalog on any problem.
+
+    A missing or corrupt registry means "no skills registered" — the pipeline
+    then routes to nothing, which is the safe state.
+    """
     empty = {"contract_version": CONTRACT_VERSION, "skills": {}}
     path = _registry_path(skills_dir)
     try:
@@ -104,6 +123,8 @@ def load_registry(skills_dir: str, warnings: list[str]) -> dict:
 
 
 def _save_registry(skills_dir: str, registry: dict) -> None:
+    """Write the catalog back, stamped with the contract version it was
+    validated against. sort_keys + indent keep diffs reviewable in git."""
     registry["contract_version"] = CONTRACT_VERSION
     os.makedirs(skills_dir, exist_ok=True)
     with open(_registry_path(skills_dir), "w", encoding="utf-8") as fh:
@@ -118,6 +139,8 @@ def register_skill(skills_dir: str, skill_dir: str,
     On rejection, messages is the complete violation list (SC-003) and the
     registry is left untouched (SC-002).
     """
+    # Validate before touching the catalog: a rejected skill must leave no
+    # trace, so the registry can never contain a non-compliant entry.
     violations = validate_manifest(skill_dir)
     if violations:
         return False, violations
@@ -126,11 +149,15 @@ def register_skill(skills_dir: str, skill_dir: str,
         manifest = json.load(fh)
     name = manifest["name"]
 
+    # Re-registering silently would let one skill shadow another with the same
+    # name; --update makes overwriting an explicit act.
     registry = load_registry(skills_dir, [])
     if name in registry["skills"] and not update:
         return False, [f"duplicate-name: '{name}' is already registered "
                        f"(pass --update to re-register with intent)"]
 
+    # Only the basename is stored: entries stay valid whatever path the
+    # register command was run from, and resolution is always skills/<dir>.
     registry["skills"][name] = {
         "dir": os.path.basename(os.path.normpath(skill_dir)),
         "version": manifest["version"],
@@ -149,6 +176,9 @@ def deregister_skill(skills_dir: str, name: str,
     del registry["skills"][name]
     _save_registry(skills_dir, registry)
 
+    # Deregistering does not edit routes.json — that is the operator's file.
+    # Instead, warn about the dangling reference so it can be cleaned up; at
+    # run time the executor would simply report the skill as "skipped".
     warnings: list[str] = []
     if routes_path and os.path.isfile(routes_path):
         try:
@@ -166,7 +196,11 @@ def deregister_skill(skills_dir: str, name: str,
 
 
 def validate_registry(skills_dir: str) -> dict:
-    """Re-validate every registered skill against the current contract (FR-008)."""
+    """Re-validate every registered skill against the current contract (FR-008).
+
+    Skills are validated at registration time, but the contract itself evolves
+    and skill directories are edited afterwards — this is the drift check.
+    """
     warnings: list[str] = []
     registry = load_registry(skills_dir, warnings)
     report = {
@@ -181,6 +215,11 @@ def validate_registry(skills_dir: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI: register / deregister / resolve / list / validate.
+
+    Exit 0 = success, 1 = rejected or non-compliant, so these commands compose
+    in shell scripts and CI.
+    """
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--skills-dir", default="skills")
     parser = argparse.ArgumentParser(

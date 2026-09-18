@@ -4,6 +4,15 @@ install.py — gitAiOrchestrator installer
 
 Sets up git hooks, creates required directories, and validates prerequisites.
 
+Feature 001. Install is nothing but git configuration: point core.hooksPath at
+the versioned .githooks/ directory and make sure the scripts are executable.
+No daemon, no service, nothing to keep running.
+
+Two properties the whole file is built around:
+  * idempotent — every step reports done/skipped and re-running changes nothing
+  * all-or-nothing on prerequisites — every check runs and is reported before
+    any change is made, so the user fixes their environment in one pass
+
 Usage:
     python install.py
 
@@ -52,8 +61,13 @@ def _error(msg: str) -> None:
 # Data model
 # ---------------------------------------------------------------------------
 
+# --- Data model -------------------------------------------------------------
+# Checks and steps return values instead of printing-and-exiting, which is what
+# lets main() collect a full report and keeps the pieces unit-testable.
+
 @dataclass
 class Prerequisite:
+    """A tool that must be present, and how to check its version."""
     name: str
     command: str
     min_version: tuple[int, ...] | None
@@ -64,6 +78,7 @@ class Prerequisite:
 
 @dataclass
 class CheckResult:
+    """Outcome of one prerequisite check: ok / missing / outdated."""
     prerequisite: Prerequisite
     status: Literal["ok", "missing", "outdated"]
     found_version: tuple[int, ...] | None
@@ -72,6 +87,7 @@ class CheckResult:
 
 @dataclass
 class StepResult:
+    """Outcome of one install step. "skipped" = already in the desired state."""
     action: str
     status: Literal["done", "skipped", "warned", "failed"]
     detail: str | None = None
@@ -86,6 +102,7 @@ class InstallResult:
 
 @dataclass
 class InstallConfig:
+    """What to install, kept in one place rather than scattered as literals."""
     hooks_path: str
     dirs_to_create: list[str]
     hooks_to_install: list[str]
@@ -97,6 +114,12 @@ class InstallConfig:
 # ---------------------------------------------------------------------------
 
 def _parse_git_version(output: str) -> tuple[int, ...]:
+    """First dotted numeric token from `git --version`.
+
+    Version tuples compare directly (2, 39, 5) < (2, 48, 1), which is why the
+    minimum is expressed as a tuple too. Distributions append suffixes like
+    "(Apple Git-154)", so non-numeric segments are dropped rather than parsed.
+    """
     # "git version 2.48.1" → (2, 48, 1)
     for token in output.strip().split():
         if "." not in token:
@@ -122,6 +145,8 @@ def _parse_semver(output: str) -> tuple[int, ...]:
 # Prerequisites
 # ---------------------------------------------------------------------------
 
+# min_version=None means presence-only: the tool is required, but any version
+# will do. Every entry here is enforced — a missing one aborts the install.
 PREREQUISITES: list[Prerequisite] = [
     Prerequisite(
         name="git",
@@ -149,6 +174,7 @@ PREREQUISITES: list[Prerequisite] = [
 
 
 def check_tool(prereq: Prerequisite) -> CheckResult:
+    """Presence on PATH, then version when the prerequisite declares one."""
     if not shutil.which(prereq.command):
         return CheckResult(
             prerequisite=prereq,
@@ -203,11 +229,17 @@ def run_checks(prerequisites: list[Prerequisite]) -> list[CheckResult]:
 # Install steps
 # ---------------------------------------------------------------------------
 
+# The installed hook is a two-line shim that exec's the versioned script. That
+# indirection is the point: scripts/ is committed and can change freely, while
+# what git actually invokes never has to be reinstalled.
 _HOOK_LAUNCHER = """\
 #!/bin/sh
 exec "$(git rev-parse --show-toplevel)/scripts/{name}.sh"
 """
 
+# Only written when scripts/<name>.sh is absent (installing into a repo that
+# does not carry them). A no-op stub keeps the hook chain valid until real
+# logic is added; existing scripts are never overwritten.
 _STUB_SCRIPT = """\
 #!/bin/sh
 # {name} hook — placeholder implementation
@@ -217,6 +249,7 @@ exit 0
 
 
 def create_directories(config: InstallConfig, repo_root: Path) -> list[StepResult]:
+    """Create the directories the pipeline writes to. Existing ones = skipped."""
     results = []
     for d in config.dirs_to_create:
         path = repo_root / d
@@ -231,6 +264,12 @@ def create_directories(config: InstallConfig, repo_root: Path) -> list[StepResul
 
 
 def install_hooks(config: InstallConfig, repo_root: Path) -> list[StepResult]:
+    """Write the .githooks/<event> shims and make them executable.
+
+    An existing hook file is never rewritten — only chmod'ed if needed. A hook
+    that exists but is not executable is silently ignored by git, which is the
+    most common "why did nothing happen?" install problem.
+    """
     results = []
     hooks_dir = repo_root / config.hooks_path
 
@@ -256,6 +295,7 @@ def install_hooks(config: InstallConfig, repo_root: Path) -> list[StepResult]:
 
 
 def install_scripts(repo_root: Path, hook_names: list[str]) -> list[StepResult]:
+    """Ensure scripts/<event>.sh exists and is executable (stub if absent)."""
     results = []
     scripts_dir = repo_root / "scripts"
 
@@ -278,6 +318,12 @@ def install_scripts(repo_root: Path, hook_names: list[str]) -> list[StepResult]:
 
 
 def configure_hooks_path(target: str, repo_root: Path) -> StepResult:
+    """Point git at .githooks/ — the one setting that activates everything.
+
+    --local only: never touch the user's global git config. If some other
+    hooksPath is already configured, that is someone else's tooling, so ask
+    before overwriting and treat a declined prompt (or no TTY) as an abort.
+    """
     result = subprocess.run(
         ["git", "config", "--local", "core.hooksPath"],
         capture_output=True,
@@ -314,6 +360,11 @@ def configure_hooks_path(target: str, repo_root: Path) -> StepResult:
 
 
 def update_gitignore(entry: str, repo_root: Path) -> StepResult:
+    """Add an ignore entry if no equivalent form is already present.
+
+    logs/ holds hook output and run records — local diagnostics that would
+    otherwise show up as noise in every status and diff.
+    """
     gitignore = repo_root / ".gitignore"
     normalized = entry.rstrip("/")
 
@@ -339,6 +390,7 @@ def update_gitignore(entry: str, repo_root: Path) -> StepResult:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Check everything, then change everything, then summarize."""
     # Not-in-git-repo guard
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -359,6 +411,8 @@ def main() -> None:
     )
 
     # --- Prerequisite checks (collect all before exiting) ---
+    # All checks run before the first failure is reported, so the user sees
+    # the complete list of what to install rather than one item at a time.
     checks = run_checks(PREREQUISITES)
     failures = [c for c in checks if c.status != "ok"]
 
@@ -381,12 +435,15 @@ def main() -> None:
     hooks_path_result = configure_hooks_path(config.hooks_path, repo_root)
     all_steps.append(hooks_path_result)
 
+    # Without hooksPath nothing is wired up, so a declined overwrite is fatal —
+    # better a clear failure than an install that silently does nothing.
     if hooks_path_result.status == "failed":
         sys.exit(1)
 
     all_steps.append(update_gitignore("logs/", repo_root))
 
     # --- Summary ---
+    # Everything skipped = a re-run on an already-configured repo (idempotency).
     if all(s.status == "skipped" for s in all_steps):
         _ok("Already configured. Nothing to do.")
     else:

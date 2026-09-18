@@ -15,17 +15,32 @@ import sys
 from datetime import datetime, timezone
 
 RECORD_SCHEMA_VERSION = "1.0"
+# Reserved exit code: the ONLY value that makes a git hook abort the operation.
+# Router returns it; _finish_hook in scripts/lib.sh translates it (see 002).
 BLOCK_EXIT_CODE = 10
-OUTCOMES = ("block", "warn", "skip")
-DEFAULT_RETENTION = 50
+OUTCOMES = ("block", "warn", "skip")  # configurable in routes.json → outcomes
+DEFAULT_RETENTION = 50                # run records kept before pruning oldest
 DEFAULT_RUNS_DIR = "logs/runs"
+# post-merge is excluded: the merge has already happened, so blocking it would
+# be theatre — such rules are downgraded to warn instead.
 BLOCKABLE_EVENTS = ("pre-commit", "pre-push")
 
 
 def evaluate_outcomes(summary: dict, outcome_rules: dict, event: str) -> dict:
-    """Map each execution result to an outcome per the configured rules."""
+    """Map each execution result to an outcome per the configured rules.
+
+    The safety rules of feature 008, in one place:
+      * success            → "none" (rules only ever apply to non-success)
+      * no/invalid rule    → "warn" (FR-009, safe by default)
+      * explicit rule      → block / warn / skip as configured
+      * block on post-merge→ downgraded to warn, flagged block_downgraded
+      * run's final outcome→ the strongest of them: block > warn > none
+
+    Pure function: no I/O, no side effects — which is what makes the whole
+    block/warn/skip matrix cheap to test exhaustively.
+    """
     results: list[dict] = []
-    notes: list[str] = []
+    notes: list[str] = []   # config problems, surfaced but never fatal
     block_downgraded = False
 
     for r in summary.get("results", []):
@@ -38,12 +53,15 @@ def evaluate_outcomes(summary: dict, outcome_rules: dict, event: str) -> dict:
             outcome = "none"
             reason = "skill succeeded"
         else:
+            # failure / timeout / skipped all consult the same on_failure rule.
             requested = rule.get("on_failure") if rule else None
             if requested in OUTCOMES:
                 outcome = requested
                 reason = (f"rule outcomes.{skill}.on_failure={requested} "
                           f"matched status '{status}'")
             else:
+                # A rule object that exists but is malformed is worth a note;
+                # no rule at all is the normal case and stays silent.
                 if rule is not None:
                     notes.append(f"invalid outcome rule for '{skill}' "
                                  f"({requested!r}) — defaulting to warn")
@@ -59,6 +77,7 @@ def evaluate_outcomes(summary: dict, outcome_rules: dict, event: str) -> dict:
                         "detail": r.get("detail", ""),
                         "rule": rule, "outcome": outcome, "reason": reason})
 
+    # Strongest outcome wins; "skip" records the failure but stays silent.
     if any(r["outcome"] == "block" for r in results):
         final = "block"
     elif any(r["outcome"] == "warn" for r in results):
@@ -72,10 +91,17 @@ def evaluate_outcomes(summary: dict, outcome_rules: dict, event: str) -> dict:
 
 def build_run_record(context: dict, plan: list[str], summary: dict,
                      evaluation: dict, warnings: list[str]) -> dict:
+    """Assemble the run-record@1.0 document for one automation run.
+
+    Also pure: building the record and writing it are separate so a full record
+    can be asserted in tests without touching the filesystem.
+    """
     now = datetime.now(timezone.utc)
     event = context.get("event")
     return {
         "schema_version": RECORD_SCHEMA_VERSION,
+        # UTC timestamp first → ids sort lexically in chronological order,
+        # which is what makes listing and pruning a plain sorted() of names.
         "id": f"{now.strftime('%Y%m%dT%H%M%S.%f')}Z-{event}",
         "event": event,
         "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -94,13 +120,19 @@ def build_run_record(context: dict, plan: list[str], summary: dict,
 
 def write_run_record(runs_dir: str, record: dict,
                      retention: int = DEFAULT_RETENTION) -> str | None:
-    """Persist a record and prune history. Best-effort: never raises (SC-002)."""
+    """Persist a record and prune history. Best-effort: never raises (SC-002).
+
+    Returns the path written, or None if the write failed. Observability must
+    never be able to break the git operation it is observing, so an unwritable
+    logs/runs/ is reported, not raised.
+    """
     try:
         os.makedirs(runs_dir, exist_ok=True)
         path = os.path.join(runs_dir, f"{record['id']}.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(record, fh, indent=2)
             fh.write("\n")
+        # Prune oldest-first: names sort chronologically (see the id format).
         names = sorted(n for n in os.listdir(runs_dir) if n.endswith(".json"))
         for stale in names[:-retention] if retention > 0 else []:
             os.unlink(os.path.join(runs_dir, stale))
@@ -110,7 +142,11 @@ def write_run_record(runs_dir: str, record: dict,
 
 
 def list_runs(runs_dir: str) -> list[dict]:
-    """Newest-first lightweight summaries of retained runs."""
+    """Newest-first lightweight summaries of retained runs.
+
+    Unreadable or corrupt record files are skipped rather than aborting the
+    listing — one bad file must not hide the rest of the history.
+    """
     try:
         names = sorted((n for n in os.listdir(runs_dir) if n.endswith(".json")),
                        reverse=True)
@@ -133,6 +169,7 @@ def list_runs(runs_dir: str) -> list[dict]:
 
 
 def load_run(runs_dir: str, run_id: str) -> dict | None:
+    """Read one full record by id; None when missing or unparseable."""
     path = os.path.join(runs_dir, f"{run_id}.json")
     try:
         with open(path, encoding="utf-8") as fh:
@@ -142,6 +179,12 @@ def load_run(runs_dir: str, run_id: str) -> dict | None:
 
 
 def _render(record: dict) -> str:
+    """Format a record for `show`: what ran, what happened, and why (FR-002).
+
+    Every skill line carries status, duration, the rule that applied, the
+    outcome, and the reason — so an unexpected block can be diagnosed from the
+    record alone, without re-running the automation.
+    """
     lines = [
         f"run      {record['id']}",
         f"event    {record['event']}  branch {record['branch']}  at {record['timestamp']}",
@@ -168,6 +211,7 @@ def _render(record: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI: `list [--limit N]` and `show <run-id>|--last`."""
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR)
     parser = argparse.ArgumentParser(description="Automation run history")

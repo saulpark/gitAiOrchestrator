@@ -244,3 +244,44 @@ def test_cli_hooks_enabled_omits_settings_override(tmp_path):
     assert json.loads(r.stdout)["status"] == "ok"
     argv = (tmp_path / "bin" / "argv.txt").read_text()
     assert "disableAllHooks" not in argv
+
+
+# --- error payloads (contract: "claude exited non-zero OR emitted an error payload") ---
+
+def test_nonzero_exit_reports_payload_reason_not_empty_stderr():
+    """The CLI puts the reason in stdout JSON; stderr is often empty."""
+    stdout = json.dumps({"is_error": True, "subtype": "error_during_execution",
+                         "result": "Failed to authenticate: OAuth session expired"})
+    result = invoke(_request(), DEFAULT_CONFIG,
+                    _fake_runner([], returncode=1, stdout=stdout, stderr=""))
+    assert result["status"] == "error"
+    assert "OAuth session expired" in result["error"]
+    assert "1" in result["error"]
+
+
+def test_nonzero_exit_names_subtype_when_result_is_null():
+    """error_max_turns carries a null result — the subtype is the only clue."""
+    stdout = json.dumps({"is_error": True, "subtype": "error_max_turns",
+                         "result": None, "num_turns": 3})
+    result = invoke(_request(), DEFAULT_CONFIG,
+                    _fake_runner([], returncode=1, stdout=stdout, stderr=""))
+    assert result["status"] == "error"
+    assert "error_max_turns" in result["error"]
+
+
+def test_error_payload_with_zero_exit_is_an_error():
+    """is_error: true must not be reported as a successful invocation."""
+    stdout = json.dumps({"is_error": True, "api_error_status": 429,
+                         "result": "Fable 5 requires usage credits."})
+    result = invoke(_request(), DEFAULT_CONFIG,
+                    _fake_runner([], returncode=0, stdout=stdout))
+    assert result["status"] == "error"
+    assert "usage credits" in result["error"]
+    assert "429" in result["error"]
+
+
+def test_nonzero_exit_falls_back_to_stderr_when_payload_is_not_an_error():
+    """A crash with no usable payload still reports whatever stderr said."""
+    result = invoke(_request(), DEFAULT_CONFIG,
+                    _fake_runner([], returncode=2, stdout="not json", stderr="boom"))
+    assert result["status"] == "error" and "boom" in result["error"]
