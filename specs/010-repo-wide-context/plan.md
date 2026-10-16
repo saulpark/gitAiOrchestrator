@@ -139,3 +139,10 @@ The current text forbids this, so the amendment is part of 010 and is applied fi
 
   file-counter needed `time_budget_seconds: 600`, plus a single Grep `^` count call
   instead of reading every file. Its first two versions timed out.
+
+### Later changes to file-counter (skill-level, not framework)
+
+- 1.2.0 (2026-10-02): line counting removed at the user's request; it counts files by type
+  only, with a 300 s budget.
+- 1.2.1 (2026-10-16): budget raised to 600 s. A real run took 299 s and the next one
+  timed out at 300 s, so 300 s was exactly the normal duration.

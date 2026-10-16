@@ -43,7 +43,21 @@ _finish_hook() {
     exit 0
 }
 
-# Run "$@" with the HOOK_CEILING_SECONDS timeout. Prefers timeout/gtimeout;
+# Print the name of a GNU-compatible timeout command (timeout, then gtimeout), or
+# nothing. The name alone is not enough: on Windows, System32	imeout.exe is a
+# different program that rejects `timeout 610 cmd` with exit 1 and would skip the
+# whole pipeline, so each candidate must identify itself as GNU via --version.
+_gnu_timeout() {
+    for _T in timeout gtimeout; do
+        command -v "$_T" >/dev/null 2>&1 || continue
+        case "$("$_T" --version 2>/dev/null </dev/null)" in
+            *GNU*) printf '%s' "$_T"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# Run "$@" with the HOOK_CEILING_SECONDS timeout. Prefers a GNU timeout/gtimeout;
 # falls back to a POSIX watchdog subshell that kills the command when the
 # timer fires.
 #
@@ -52,10 +66,9 @@ _finish_hook() {
 # `timeout` is not in POSIX and macOS ships without it (gtimeout comes from
 # coreutils), hence the three-way fallback.
 _run_with_timeout() {
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$HOOK_CEILING_SECONDS" "$@"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$HOOK_CEILING_SECONDS" "$@"
+    _TIMEOUT_CMD=$(_gnu_timeout)
+    if [ -n "$_TIMEOUT_CMD" ]; then
+        "$_TIMEOUT_CMD" "$HOOK_CEILING_SECONDS" "$@"
     else
         # Watchdog: run the command in the background and poll it, killing it
         # when the ceiling is reached.

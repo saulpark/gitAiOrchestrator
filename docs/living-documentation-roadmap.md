@@ -5,6 +5,20 @@
 **Scope:** features 009, 010, 011
 **Depends on:** 001–008 (all complete)
 
+> **Superseded in part by feature 009 (`specs/009-aioutput-skills/`, 2026-10-02).**
+> Feature numbers in this document shift by three (009→012, 010→013, 011→014, 012→015):
+> 009 became the `_aioutput` skills, 010 repo-wide read context, 011 the installer check.
+> Constitution principles 1, 3 and 8 were amended by 010: Claude may now read the whole
+> repository (read-only); the "bounded context" wording below is the pre-010 text.
+> Since 009, skills are declarative prompts and Claude runs **read-only**; results go to
+> `_aioutput/` only. Anything below that relies on a Python skill or on Claude editing
+> project files is incompatible as written and must be re-scoped (e.g. emit proposals to
+> `_aioutput/`) before it is specified. 009 also delivers per-skill async execution,
+> overlapping the async-mode feature planned here.
+>
+> **Update 2026-10-16:** the team's Documentation Guidelines and the open questions are in
+> §10 at the end of this document. Where §10 differs from §3–§5, §10 wins.
+
 ---
 
 ## 1. Purpose
@@ -475,3 +489,119 @@ problem in practice.
 Deliberately **not** in scope: CI/server-side execution, doc generation for source that has
 no doc target, translation or restructuring of existing docs, and any automation that
 commits on the developer's behalf.
+
+---
+
+## 10. Update 2026-10-16 — the Documentation Guidelines and the open questions
+
+This section supersedes §3 (decisions), §4 and §5 (features 009–011) wherever they differ.
+It records what the team's documentation standard says, what a skill can do with it
+under the current framework, and the questions to settle **one by one** before any skill is
+specified. Decisions are written back into §10.5 as they are made.
+
+### 10.1 Source
+
+Confluence page "0. Documentation Guidelines" (space EHAP, page id 2915893283), read from
+a PDF export of 2026-10-16 (4 pages). The Confluence API could not be used: the
+`JIRA_TOKEN` environment variable was accepted but the API answered 403 "caller cannot
+access Confluence", both on the site URL and the Atlassian gateway. The page is
+therefore known only as of that export. The checked-in copy is not created yet (see Q8).
+
+### 10.2 What the page defines
+
+An outline of the sections a team's documentation must contain, following the arc42
+architecture-documentation template. Each entry has a one-paragraph description and an
+example written for an "Allianz Direct Insurance Platform".
+
+| # | Section | Entries |
+|---|---------|---------|
+| 1 | Introduction and Goals | 1.x Team Name; 1.x.1 Team Overview; 1.x.2 Scope Overview & Roadmap; 1.x.3 Team Calendar |
+| 2 | Business Context | 2.x.1 System Interaction Overview; 2.x.2 Functional Architecture; 2.x.3 Product Configuration |
+| 3 | Features & Components | 3.x.1 Feature Catalog; 3.x.2 Features / Components; 3.x.3 Architectural Diagrams |
+| 4 | Third Party Integrations | 4.x.1 Overview; 4.x.2 List |
+| 5 | Runtime View | 5.x.1 How-To / Instructions; 5.x.2 Troubleshooting; 5.x.3 Maintenance & Support |
+| 6 | Architectural Decisions | one section |
+| 7 | Testing | one section |
+| 8 | Project Management | project teams only |
+| 9 | Area Management | 9.1 QBR Preparation; 9.2 Risk Management |
+| 10 | ABS Configuration | ABS Foundation Team only |
+
+The page also points to an existing "AllianzDirect Documentation Agent" on the Agent
+Marketplace, and to the agile coach or Domain & Project Functional Lead for support.
+
+### 10.3 Assessment: clear enough to start?
+
+**Clear:** the list of sections and what each one is for; which sections are team-specific
+(8, 10).
+
+**Not clear:**
+
+1. It describes content, not format: no templates, required headings, file names, diagram
+   format, level of detail, or definition of "complete".
+2. Many sections cannot be derived from a repository: team overview, scope and roadmap,
+   team calendar, QBR preparation, risk management, project management, area management.
+   A skill that reads code would have to invent them.
+3. The examples are generic insurance-platform wording, so what is mandatory and what is
+   illustration is not stated.
+4. The `x` in `1.x.1`, `2.x.1`… is not defined.
+5. The Documentation Agent already exists. Whether this work replaces it, complements it,
+   or must match its output is not stated.
+
+**Sections a repo-reading skill can plausibly cover** (derivable from code, specs, config):
+2.x.1, 2.x.2, 2.x.3, 3.x.1, 3.x.2, 3.x.3, 4.x.1, 4.x.2, 5.x.1, 5.x.2, 6 (partly: decisions
+live in specs and plans) and 7.
+
+### 10.4 Constraints from the current framework (since 009–011)
+
+- Skills are prompts. Claude is **read-only** (`Read`, `Grep`, `Glob`). The only thing a
+  skill produces is a report in `_aioutput/<skill>/`. It cannot write into `docs/` or any
+  tracked file. The old design where Claude edits `TUTORIAL.md` in the working tree (§4.1,
+  §5 feature 011, the anchored-region editing and rollback) does not apply.
+- Claude may read the whole repository (010); the changed files are only the focus.
+- The hook environment has no Confluence access, and `--restricted` Claude has no network.
+  The guidelines must therefore be a file inside the repository that the prompt reads.
+- A `block` outcome only applies to sync skills on `pre-commit` / `pre-push`. A
+  documentation skill should be async, so it cannot block.
+- Framework changes are decided deliberately, as features, never because one skill needs
+  them (project principle). Anything that makes a skill write tracked files is such a
+  change.
+- Reuse from the old plan: generate nothing when no relevant code changed (the "docs-only
+  change set" guard), which a prompt can express. The deterministic target map
+  (`config/doc-targets.json`) and the anchored-region writer do not carry over unless a
+  later decision brings them back.
+
+### 10.5 Open questions
+
+Each question is settled in its own step. Record the decision and the date in the Decision
+column; update dependent questions when one answer changes them.
+
+| # | Question | Why it matters | Status | Decision |
+|---|----------|----------------|--------|----------|
+| Q1 | **Which repository is the skill for?** This repo is a developer tool, not the insurance platform. Is it meant to document the repo it is installed in (here, gitAiOrchestrator), or be copied into the team's real platform repos? | Decides whether it can be tested on real code, and whether the examples in the guidelines apply at all | open | |
+| Q2 | **Which sections are in scope?** Only the technical ones in §10.3, or also placeholders ("to be filled in manually") for the people-and-process sections? | Without this the skill would invent content | open | |
+| Q3 | **Where do the documents end up?** A draft in `_aioutput/` that a person copies, or written straight into `docs/` (a framework feature, 012+)? | Read-only constraint (§10.4); drives whether any framework work is needed | open | |
+| Q4 | **File layout and format.** One file per section or a single file? Markdown? Diagrams as Mermaid, PlantUML or images? Language (English only?) | The guidelines give no format | open | |
+| Q5 | **Relation to the Documentation Agent.** Does its output define the format to match, or may we choose? Can a sample be shared? | An existing tool may already own part of this | open | |
+| Q6 | **Triggers and mode.** Suggested: async on `pre-push` only (a full run costs a few tens of cents and 5–10 minutes). Also `post-merge`? Manual? | Cost and noise | open | |
+| Q7 | **Missing information.** When the repo does not contain what a section needs: write "Not documented in the repository", or skip the section? Suggested: say so explicitly, never invent | Reliability of the output | open | |
+| Q8 | **Copy of the guidelines.** Save the extracted text as a file in the repo (e.g. `docs/documentation-guidelines.md`) for the prompt to read. Who updates it when the Confluence page changes? | The hook cannot reach Confluence (§10.1) | open | |
+| Q9 | **Secrets.** The skill reads the whole repo and writes plain-text reports. Forbid quoting credentials, `.env` contents and internal URLs in the prompt? | Risk accepted in 010 | open | |
+| Q10 | **How is the output judged?** With a read-only skill the checks are a fixed report structure and a `pass` / `fail` verdict. Is that enough, or is more validation needed? | Replaces the old validate-and-roll-back design | open | |
+| Q11 | **Budget.** `time_budget_seconds` up to 600 and a few tens of cents per run: acceptable on every push? | Cost | open | |
+| Q12 | **Confluence access.** Do we need API access at all, or is the exported copy enough? If needed: `JIRA_TOKEN` gets 403 on Confluence; it needs Confluence read scope or basic auth (email + token) | Only matters if the guidelines should be refreshed automatically | open | |
+
+Suggested order: Q1 → Q2 → Q3 → Q4, because the answers shape the rest.
+
+### 10.6 Proposed first version (pending Q1–Q4)
+
+A single async skill, `living-docs`, routed on `pre-push`. It reads the repository and the
+checked-in guidelines and writes a draft of each in-scope document to `_aioutput/living-docs/`.
+No framework change. Anything beyond that (writing into `docs/`, a code-to-doc target map,
+validation with rollback) is a separate feature, decided on its own.
+
+### 10.7 Next actions
+
+1. Resolve Q1–Q4 in order, one at a time; record each in §10.5.
+2. Create the checked-in copy of the guidelines (Q8), once agreed.
+3. Write the plan and tasks (a single `.md` for a small ticket, per the working rules)
+   before any skill is created.

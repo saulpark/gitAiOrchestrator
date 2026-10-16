@@ -117,7 +117,7 @@ python3 src/run_records.py show --last
 |---------|---------|
 | `Not logged in` | the hooks cannot authenticate: set the provider variables from "Claude authentication for the hooks" above and re-run `python3 install.py` from a normal terminal |
 | `unavailable` / CLI too old | `claude` is missing or older than 2.1.287: upgrade it |
-| `timeout` | the skill needed more than its `time_budget_seconds` (max 600) |
+| `timeout` | the skill needed more than its `time_budget_seconds` (max 600). `file-counter` normally takes about 5 minutes, so it ships with 600 |
 | credentials expired (Bedrock/SSO) | refresh them yourself, e.g. `aws sso login`; the hooks never run `awsAuthRefresh` |
 
 ## 2. Your first skill
@@ -456,6 +456,11 @@ Two layers, deliberately: `.githooks/<event>` is a two-line shim that `exec`s
 - `scripts/orchestrate.sh` — the entry point: `parse_context.py | route_workflows.py`.
 
 Invariant: a broken, missing, or slow orchestration can only ever be *logged*.
+
+`_run_with_timeout` only trusts a `timeout` that identifies itself as GNU (`--version`).
+Windows ships its own, unrelated `System32	imeout.exe`, which rejects the call with exit 1
+and would silently skip every skill (seen from GitHub Desktop). Anything else falls back
+to the POSIX watchdog.
 
 ### 003 — Hook context parser (`src/parse_context.py`)
 

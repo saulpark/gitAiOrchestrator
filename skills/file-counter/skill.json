@@ -1,7 +1,7 @@
 {
   "name": "file-counter",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Counts every file in the repository and summarises them by type",
   "input": "hook-context@1.0",
-  "time_budget_seconds": 300
+  "time_budget_seconds": 600
 }
