@@ -14,7 +14,7 @@ Two properties the whole file is built around:
     any change is made, so the user fixes their environment in one pass
 
 Usage:
-    python install.py
+    python install.py [--skip-claude-check]
 
 Must be run from inside the target git repository (any subdirectory works).
 """
@@ -28,6 +28,8 @@ if sys.version_info < (3, 10):
         "See https://www.python.org/downloads/"
     )
 
+import argparse
+import json
 import os
 import re
 import shutil
@@ -36,6 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
+# The Claude checks reuse the bridge's confinement so "passes here" means
+# "passes in the hooks" — one definition, not a copy (feature 011).
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from claude_bridge import CONFINEMENT_ARGS, MIN_CLI_VERSION, _payload_error
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -166,9 +172,12 @@ PREREQUISITES: list[Prerequisite] = [
     Prerequisite(
         name="claude CLI",
         command="claude",
-        min_version=None,
+        # 009: older CLIs lack the confinement flags, so every skill would end
+        # as `unavailable`. Better to say so now than on every commit.
+        min_version=MIN_CLI_VERSION,
         version_flag="--version",
         install_url="https://claude.ai/code",
+        version_parse=_parse_semver,
     ),
 ]
 
@@ -220,9 +229,210 @@ def check_tool(prereq: Prerequisite) -> CheckResult:
     )
 
 
+# The hooks do not run under the interpreter running this installer: they
+# resolve their own (scripts/orchestrate.sh). On Windows `python3` is usually
+# the Microsoft Store stub, so "this installer runs" proves nothing about the
+# hooks. Same candidates, same order as the probe in orchestrate.sh.
+HOOK_PYTHON_CANDIDATES: list[list[str]] = [["python3"], ["python"], ["py", "-3"]]
+_HOOK_PYTHON_PROBE = "import sys; sys.exit(sys.version_info < (3, 10))"
+
+HOOK_PYTHON = Prerequisite(
+    name="python for hooks",
+    command="python3 | python | py -3",
+    min_version=(3, 10),
+    version_flag="",
+    install_url=(
+        "https://www.python.org/downloads/ (on Windows, also disable the "
+        "python/python3 App Execution Aliases in Settings)"
+    ),
+)
+
+
+def _probe_python(argv: list[str]) -> bool:
+    """True when argv runs a Python 3.10+. Missing or hung = not usable.
+
+    The command is resolved through PATH explicitly, as the hook's shell does:
+    on Windows, subprocess would otherwise find it in the running
+    interpreter's own directory first and report a Python the hooks can't see.
+    """
+    resolved = shutil.which(argv[0])
+    if resolved is None:
+        return False
+    try:
+        result = subprocess.run(
+            [resolved, *argv[1:], "-c", _HOOK_PYTHON_PROBE],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def check_hook_python(
+    candidates: list[list[str]] = HOOK_PYTHON_CANDIDATES,
+    probe: Callable[[list[str]], bool] = _probe_python,
+) -> CheckResult:
+    """The first candidate the hooks would pick, or "missing" if none works."""
+    for argv in candidates:
+        if probe(argv):
+            return CheckResult(
+                prerequisite=HOOK_PYTHON,
+                status="ok",
+                found_version=None,
+                message=f"hooks will use '{' '.join(argv)}' (Python 3.10+)",
+            )
+    tried = ", ".join(" ".join(c) for c in candidates)
+    return CheckResult(
+        prerequisite=HOOK_PYTHON,
+        status="missing",
+        found_version=None,
+        message=f"no working Python 3.10+ for the hooks (tried: {tried})",
+    )
+
+
 def run_checks(prerequisites: list[Prerequisite]) -> list[CheckResult]:
     """Check all prerequisites before making any changes. Never short-circuits."""
     return [check_tool(p) for p in prerequisites]
+
+
+# ---------------------------------------------------------------------------
+# Claude authentication for the hooks (feature 011)
+# ---------------------------------------------------------------------------
+
+# The hooks run Claude with --restricted, which ignores ~/.claude/settings.json
+# — including its `env` block, where provider setups (Bedrock, Vertex, …) often
+# live. `claude auth status` reads that file, so it says "logged in" while every
+# skill fails with "Not logged in". These are the names worth reporting when
+# they exist only in the settings file (Claude Code docs, 2026-10-02).
+RELEVANT_ENV = frozenset({
+    # providers
+    "CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    # Anthropic API / gateways
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    # model pins (required on Foundry, optional elsewhere)
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    # network
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "NODE_EXTRA_CA_CERTS", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+})
+# Settings keys (not variables) that produce credentials. Under --restricted
+# they are never run, and no environment variable can stand in for the key.
+IGNORED_AUTH_SETTINGS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")
+CLAUDE_PROBE_PROMPT = "Reply with the single word OK."
+CLAUDE_PROBE_TIMEOUT = 90
+
+
+@dataclass
+class ClaudeAuthResult:
+    """Can the hooks' confined Claude answer? ok / failed / skipped."""
+    status: Literal["ok", "failed", "skipped"]
+    missing: list[str] = field(default_factory=list)   # names only, never values
+    ignored: list[str] = field(default_factory=list)
+    error: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+def user_settings_path(environ: dict) -> Path:
+    base = environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "settings.json"
+
+
+def read_user_settings(path: Path) -> dict:
+    """The user's Claude settings, or {} when missing/unreadable. Never raises."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def missing_env(settings: dict, environ: dict) -> list[str]:
+    """Relevant names set in settings' `env` but absent from the environment.
+
+    Pure. Only names are compared — values are never read out or printed.
+    """
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        return []
+    return sorted(n for n in env if n in RELEVANT_ENV and n not in environ)
+
+
+def ignored_settings(settings: dict) -> list[str]:
+    """Credential-producing settings keys the hooks will never run. Pure."""
+    return [k for k in IGNORED_AUTH_SETTINGS if k in settings]
+
+
+def _run_claude(argv: list[str], stdin: str, timeout: float) -> tuple[int, str, str]:
+    proc = subprocess.run(argv, input=stdin, text=True, encoding="utf-8",
+                          errors="replace", capture_output=True, timeout=timeout,
+                          check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def probe_claude(command: str = "claude", run=_run_claude,
+                 which=shutil.which) -> tuple[bool, str]:
+    """One tiny Claude call under the hooks' exact confinement → (ok, error)."""
+    resolved = which(command)
+    if resolved is None:
+        return False, f"'{command}' not found on PATH"
+    argv = [resolved, "-p", "--output-format", "json", "--max-turns", "1",
+            *CONFINEMENT_ARGS]
+    try:
+        rc, stdout, stderr = run(argv, CLAUDE_PROBE_PROMPT, CLAUDE_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"no answer within {CLAUDE_PROBE_TIMEOUT}s"
+    except OSError as exc:
+        return False, f"could not start claude: {exc}"
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        payload = None
+    failed, error = _payload_error(payload)
+    if rc != 0 or failed:
+        return False, error or stderr.strip()[:300] or f"claude exited {rc}"
+    return True, ""
+
+
+def check_claude_auth(settings: dict, environ: dict, probe: Callable[[], tuple[bool, str]],
+                      skip: bool = False) -> ClaudeAuthResult:
+    """Combine the static settings check with the live probe.
+
+    The live call decides: names missing from the environment are only the
+    explanation. They can be harmless (a model pin, or a region the AWS
+    profile already supplies), so a passing call with missing names is a note.
+    """
+    missing = missing_env(settings, environ)
+    ignored = ignored_settings(settings)
+    notes: list[str] = []
+    if environ.get("CLAUDECODE"):
+        notes.append("running inside a Claude Code session: the check may pass only "
+                     "because of variables that session provides; re-run from a "
+                     "normal terminal to be sure")
+    if ignored:
+        notes.append(f"settings key(s) {', '.join(ignored)} are not used by the hooks; "
+                     "use environment-based credentials instead")
+    if skip:
+        if missing:
+            notes.append("set only in ~/.claude/settings.json, so not seen by the hooks: "
+                         + ", ".join(missing))
+        return ClaudeAuthResult("skipped", missing, ignored, "", notes)
+
+    ok, error = probe()
+    if ok:
+        if missing:
+            notes.append("not applied to the hooks (Claude still works without them): "
+                         + ", ".join(missing))
+        return ClaudeAuthResult("ok", missing, ignored, "", notes)
+    return ClaudeAuthResult("failed", missing, ignored, error, notes)
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +599,12 @@ def update_gitignore(entry: str, repo_root: Path) -> StepResult:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Check everything, then change everything, then summarize."""
+    parser = argparse.ArgumentParser(description="Install gitAiOrchestrator git hooks")
+    parser.add_argument("--skip-claude-check", action="store_true",
+                        help="skip the live Claude call (offline/CI installs)")
+    args = parser.parse_args(argv)
     # Not-in-git-repo guard
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -413,7 +627,7 @@ def main() -> None:
     # --- Prerequisite checks (collect all before exiting) ---
     # All checks run before the first failure is reported, so the user sees
     # the complete list of what to install rather than one item at a time.
-    checks = run_checks(PREREQUISITES)
+    checks = run_checks(PREREQUISITES) + [check_hook_python()]
     failures = [c for c in checks if c.status != "ok"]
 
     if failures:
@@ -424,6 +638,31 @@ def main() -> None:
 
     for c in checks:
         _ok(c.message)
+
+    # --- Claude must run the way the hooks run it (011) ---
+    # Still before any change: a Claude the hooks cannot use aborts the install
+    # just like a missing git.
+    auth = check_claude_auth(read_user_settings(user_settings_path(os.environ)),
+                             dict(os.environ), probe_claude,
+                             skip=args.skip_claude_check)
+    if auth.status == "failed":
+        _error(f"Claude cannot run inside the git hooks: {auth.error}")
+        if auth.missing:
+            print("        These are set in ~/.claude/settings.json, which the hooks do not")
+            print("        read. Set them as real environment variables (same values):")
+            for name in auth.missing:
+                print(f"          {name}")
+        for note in auth.notes:
+            print(f"        Note: {note}")
+        print("        See TUTORIAL.md, section 1, 'Claude authentication for the hooks'.")
+        print("        Offline/CI install: re-run with --skip-claude-check.")
+        sys.exit(1)
+    if auth.status == "ok":
+        _ok("claude answers under the hooks' read-only confinement")
+    else:
+        _skip("live Claude check (--skip-claude-check)")
+    for note in auth.notes:
+        _warn(note)
 
     # --- Installation steps ---
     all_steps: list[StepResult] = []

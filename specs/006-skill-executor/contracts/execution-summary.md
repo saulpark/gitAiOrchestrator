@@ -1,5 +1,7 @@
 # Contract: Execution Summary & Executor CLI
 
+> **Superseded in part by 009** — execution-summary `2.0` adds sync/async modes, verdicts, result files and the `error`/`dispatched`/`dispatch-failed` statuses. See `specs/009-aioutput-skills/contracts/execution-and-output.md`.
+
 **Branch**: `006-skill-executor` | **Date**: 2026-07-18
 **Schema version**: execution-summary `1.0`; DispatchResult bumped to `1.1`
 

@@ -1,10 +1,18 @@
 {
-  "version": "1.1",
+  "version": "2.0",
   "routes": {
-    "pre-commit": [],
+    "pre-commit": [
+      "file-counter"
+    ],
     "post-merge": [],
     "pre-push": []
   },
-  "outcomes": {},
-  "run_retention": 50
+  "skills": {
+    "file-counter": {
+      "mode": "async"
+    }
+  },
+  "sync_ceiling_seconds": 120,
+  "run_retention": 50,
+  "output_retention": 50
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Skill registry (feature 005).
 
-Validates skill manifests against skill contract v1.0 and maintains the
-catalog skills/registry.json. The workflow router resolves identifiers
-through this registry. Contract (the human-readable artifact developers
-consult): specs/005-skill-contract/contracts/skill-contract.md
+Validates skill manifests against skill contract v2.0 (feature 009: a skill
+is skill.json + prompt.md, no executable code) and maintains the catalog
+skills/registry.json. The executor resolves identifiers through this
+registry. Contract (the human-readable artifact developers consult):
+specs/009-aioutput-skills/contracts/skill-contract.md
 """
 from __future__ import annotations
 
@@ -14,20 +15,41 @@ import os
 import re
 import sys
 
-CONTRACT_VERSION = "1.1"   # 1.0 + optional time_budget_seconds (feature 006)
+CONTRACT_VERSION = "2.0"   # 1.1 → 2.0 (009): declarative skills, no `run`
 MAX_TIME_BUDGET_SECONDS = 600
 # Names that would collide with registry/tooling concepts on disk or in the CLI.
 RESERVED_NAMES = frozenset({"registry", "contract", "skills"})
-# Pinned schema versions: a skill must declare exactly the context it is handed
-# and the result shape the executor knows how to read.
+# Pinned schema version: a skill must declare exactly the context it is handed.
 REQUIRED_INPUT = "hook-context@1.0"
-REQUIRED_OUTPUT = "skill-result@1.0"
+PROMPT_FILE = "prompt.md"
+MANIFEST_FILE = "skill.json"
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # safe as a dir/CLI token
 _SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
 
 
+def _code_files(skill_dir: str) -> list[str]:
+    """Files in a skill dir that could be executed — anything but the
+    manifest and markdown, plus (POSIX) anything carrying an exec bit.
+
+    The no-code rule is what makes "Claude cannot modify the project" a
+    guarantee: the framework only ever reads a skill, so a skill must contain
+    nothing that something could be tempted to run.
+    """
+    found: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(skill_dir):
+        for fn in filenames:
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, skill_dir).replace(os.sep, "/")
+            allowed = rel == MANIFEST_FILE or fn.lower().endswith(".md")
+            # Windows has no exec bit: os.access(X_OK) is always true there.
+            executable = os.name != "nt" and os.access(path, os.X_OK)
+            if not allowed or executable:
+                found.append(rel)
+    return sorted(found)
+
+
 def validate_manifest(skill_dir: str) -> list[str]:
-    """Check a skill directory against contract v1.0.
+    """Check a skill directory against contract v2.0.
 
     Returns a complete list of violations in one pass (SC-003), each as
     "<rule-name>: <explanation>". Empty list = compliant.
@@ -63,19 +85,6 @@ def validate_manifest(skill_dir: str) -> list[str]:
     if manifest.get("input") != REQUIRED_INPUT:
         violations.append(f"input: must be exactly '{REQUIRED_INPUT}'")
 
-    if manifest.get("output") != REQUIRED_OUTPUT:
-        violations.append(f"output: must be exactly '{REQUIRED_OUTPUT}'")
-
-    # non_blocking must be literally true: a skill declares up front that it
-    # cannot hang the git operation. Blocking is the operator's decision, made
-    # in routes.json (feature 008), never the skill's.
-    behaviors = manifest.get("behaviors")
-    if (not isinstance(behaviors, dict)
-            or behaviors.get("non_blocking") is not True
-            or not isinstance(behaviors.get("idempotent"), bool)):
-        violations.append(
-            "behaviors: required object with non_blocking=true and boolean idempotent")
-
     # Optional (contract 1.1). isinstance(True, int) is True in Python, so
     # bools are excluded explicitly — "time_budget_seconds": true is nonsense.
     budget = manifest.get("time_budget_seconds")
@@ -86,11 +95,20 @@ def validate_manifest(skill_dir: str) -> list[str]:
             f"time-budget: time_budget_seconds must be a number in "
             f"(0, {MAX_TIME_BUDGET_SECONDS}] when present")
 
-    # The one entry point the executor knows how to call. Executability is part
-    # of the contract: a non-executable run file is a broken skill, not a skill.
-    run_path = os.path.join(skill_dir, "run")
-    if not (os.path.isfile(run_path) and os.access(run_path, os.X_OK)):
-        violations.append(f"entry-point: executable 'run' missing at {run_path}")
+    # The prompt is the skill: without one there is nothing to send to Claude.
+    prompt_path = os.path.join(skill_dir, PROMPT_FILE)
+    try:
+        with open(prompt_path, encoding="utf-8") as fh:
+            has_prompt = bool(fh.read().strip())
+    except (OSError, ValueError):
+        has_prompt = False
+    if not has_prompt:
+        violations.append(f"prompt: non-empty {PROMPT_FILE} required at {prompt_path}")
+
+    code = _code_files(skill_dir)
+    if code:
+        violations.append("executable-code: skills are declarative (skill.json + "
+                          f"*.md only); remove: {', '.join(code)}")
 
     return violations
 

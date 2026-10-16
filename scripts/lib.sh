@@ -12,9 +12,24 @@ _hook_root() {
     git rev-parse --show-toplevel
 }
 
+# Hard backstop for the whole pipeline, in seconds. The effective bound is the
+# router's sync ceiling (routes.json sync_ceiling_seconds, max 600); this only
+# fires if the Python side itself hangs (feature 009).
+HOOK_CEILING_SECONDS=610
+
+# Append one line to logs/hooks.log. Since 009 the terminal stays silent except
+# for blocks, so this is where hook-level warnings go. Never fails the hook.
+_hook_log() {
+    _LOG_DIR="$(_hook_root 2>/dev/null)/logs"
+    mkdir -p "$_LOG_DIR" 2>/dev/null && \
+        printf '[%s] hook warning %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
+            >> "$_LOG_DIR/hooks.log" 2>/dev/null
+    return 0
+}
+
 # Translate the orchestration exit code into hook behavior (008 protocol):
-# 10 = a configured block rule matched — abort the git operation.
-# Any other non-zero = orchestration problem — warn but never block.
+# 10 = a sync skill's block rule matched — abort the git operation.
+# Any other non-zero = orchestration problem — log it, never block.
 #
 # The asymmetry is deliberate: blocking must be something the operator opted
 # into per skill, never a side effect of a crash, a timeout, or a bad config.
@@ -24,23 +39,23 @@ _finish_hook() {
         exit 1   # any non-zero aborts the git operation; git ignores the value
     fi
     # 2>/dev/null: a non-numeric "$1" makes [ fail loudly — treat it as a warning.
-    [ "$1" -ne 0 ] 2>/dev/null && \
-        printf '[hook warning] orchestration failed (exit %d)\n' "$1" >&2
+    [ "$1" -ne 0 ] 2>/dev/null && _hook_log "orchestration failed (exit $1)"
     exit 0
 }
 
-# Run "$@" with a 5-second timeout. Prefers timeout/gtimeout; falls back to a
-# POSIX watchdog subshell that kills the command when the timer fires.
+# Run "$@" with the HOOK_CEILING_SECONDS timeout. Prefers timeout/gtimeout;
+# falls back to a POSIX watchdog subshell that kills the command when the
+# timer fires.
 #
 # The ceiling is on the hook, not on the skills: even if the Python pipeline
-# hangs, the developer's commit is delayed by 5 seconds, not indefinitely.
+# hangs, the developer's commit is delayed by a bounded time, not indefinitely.
 # `timeout` is not in POSIX and macOS ships without it (gtimeout comes from
 # coreutils), hence the three-way fallback.
 _run_with_timeout() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout 5 "$@"
+        timeout "$HOOK_CEILING_SECONDS" "$@"
     elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout 5 "$@"
+        gtimeout "$HOOK_CEILING_SECONDS" "$@"
     else
         # Watchdog: run the command in the background and poll it, killing it
         # when the ceiling is reached.
@@ -55,7 +70,7 @@ _run_with_timeout() {
         (
             _WAITED=0
             while kill -0 "$_PID" 2>/dev/null; do
-                if [ "$_WAITED" -ge 5 ]; then
+                if [ "$_WAITED" -ge "$HOOK_CEILING_SECONDS" ]; then
                     kill "$_PID" 2>/dev/null
                     break
                 fi

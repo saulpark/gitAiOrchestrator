@@ -1,4 +1,10 @@
 {
-  "contract_version": "1.1",
-  "skills": {}
+  "contract_version": "2.0",
+  "skills": {
+    "file-counter": {
+      "description": "Counts every file in the repository and summarises them by type",
+      "dir": "file-counter",
+      "version": "1.2.0"
+    }
+  }
 }

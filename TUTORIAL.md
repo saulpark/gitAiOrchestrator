@@ -1,15 +1,16 @@
 # gitAiOrchestrator — Tutorial
 
 gitAiOrchestrator turns git events (commit, merge, push) into automated,
-Claude-Code-powered workflows. Thin git hooks capture what changed, a router matches the
-event against `config/routes.json`, and an executor runs your registered **skills** —
-small executables that receive the change context as JSON and can call Claude Code
-through a shared bridge. Every run is recorded and can block, warn, or stay silent
-depending on rules you configure.
+Claude-Code-powered checks. Thin git hooks capture what changed, a router matches the
+event against `config/routes.json`, and for each routed **skill** (a prompt you write in
+markdown) Claude Code runs **read-only**, focused on the changed files but able to read
+the whole repository. The framework writes its report to `_aioutput/<skill>/`, and every
+run is recorded. Each skill runs **sync** (the git operation waits and may be blocked) or
+**async** (detached; git never waits).
 
 ```text
-git commit ─→ pre-commit hook ─→ parse context ─→ route ─→ execute skills ─→ outcome
-                (thin, POSIX sh)   (JSON, 003)    (004)     (005/006/007)     (008)
+git commit ─→ pre-commit hook ─→ parse context ─→ route ─→ skills (Claude, read-only) ─→ _aioutput/ + outcome
+                (thin, POSIX sh)   (JSON, 003)    (004)     (005/006/007, 009)             (008)
 ```
 
 ## 1. Installation
@@ -21,7 +22,7 @@ git commit ─→ pre-commit hook ─→ parse context ─→ route ─→ execu
 | git | ≥ 2.28 | required |
 | Python | ≥ 3.10 | runs the pipeline (stdlib only — no packages needed) |
 | [uv](https://docs.astral.sh/uv/) | any | checked by the installer; used for dev tooling |
-| [Claude Code CLI](https://claude.ai/code) | any | optional — only needed by skills that call Claude; everything else works without it |
+| [Claude Code CLI](https://claude.ai/code) | ≥ 2.1.287 | runs every skill. Must be installed **and authenticated for the hooks** (see below) — the installer checks both |
 
 ### Install
 
@@ -31,404 +32,290 @@ cd gitAiOrchestrator
 python3 install.py
 ```
 
-The installer validates the prerequisites, points `git config core.hooksPath` at the
+The installer validates the prerequisites, checks that Claude can run the way the hooks
+run it (one tiny confined call, about a cent), points `git config core.hooksPath` at the
 versioned `.githooks/` directory, and ensures the hook scripts are executable. That's it —
-no daemons, no services.
+no daemons, no services. If anything fails, nothing is changed and the installer says
+what to fix.
+
+Offline or in CI, skip the live Claude call with `python3 install.py --skip-claude-check`.
+Skills will then fail (logged in `logs/hooks.log`, never blocking git) until Claude works.
+
+### Claude authentication for the hooks
+
+Skills run Claude with `--restricted`, which **ignores `~/.claude/settings.json`**, including
+its `env` block. This is deliberate: no settings file can widen Claude's tools. The side
+effect is that if your provider is configured *only* in that file, `claude auth status`
+says you are logged in while every skill fails with `Not logged in`. The fix is to set
+the necessary variables as **real environment variables**, so that git, and therefore
+the hooks, inherit them.
+
+What you need depends on how you sign in. Set only the row that applies to you:
+
+| You use | Set these environment variables |
+|---------|---------------------------------|
+| Claude subscription (`/login`) | nothing; the stored login works under `--restricted` |
+| Anthropic API key | `ANTHROPIC_API_KEY` |
+| Amazon Bedrock | `CLAUDE_CODE_USE_BEDROCK=1`, plus your AWS credentials: `AWS_PROFILE` (or `AWS_BEARER_TOKEN_BEDROCK`, or access keys). Add `AWS_REGION` only if your AWS profile has no region |
+| Google Vertex AI | `CLAUDE_CODE_USE_VERTEX=1`, `CLOUD_ML_REGION`, `ANTHROPIC_VERTEX_PROJECT_ID` (credentials from `gcloud auth application-default login`) |
+| Microsoft Foundry | `CLAUDE_CODE_USE_FOUNDRY=1`, `ANTHROPIC_FOUNDRY_RESOURCE`, `ANTHROPIC_FOUNDRY_API_KEY` (unless you use Entra ID), and the model pins `ANTHROPIC_DEFAULT_SONNET_MODEL` / `_OPUS_MODEL` / `_HAIKU_MODEL` |
+| An LLM gateway | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` |
+| …behind a corporate proxy (any of the above) | `HTTPS_PROXY` and, if your proxy re-signs TLS, `NODE_EXTRA_CA_CERTS` |
+
+The installer tells you exactly which of these names are set in your settings file but
+missing from your environment. It prints names only, never values. Use the same values
+as in `~/.claude/settings.json`.
+
+- **Windows (PowerShell)**, once per variable, then open a new terminal or IDE:
+  `[Environment]::SetEnvironmentVariable('CLAUDE_CODE_USE_BEDROCK', '1', 'User')`
+- **macOS / Linux**: add `export CLAUDE_CODE_USE_BEDROCK=1` (and the others) to
+  `~/.profile` or your shell's rc file, then log in again.
+
+Prefer an AWS profile (`~/.aws/credentials`) plus `AWS_PROFILE` over putting secret keys
+in environment variables, since every program you run can read those. Settings keys that
+produce credentials (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`) are never
+run by the hooks. If you rely on one, switch to an environment-based credential.
+
+Run the installer from a **normal terminal**, not from inside a Claude Code session. A
+session passes its own variables to everything it starts, so the check could pass there
+and still fail on your real commits. The installer warns when it detects this.
+
+### On Windows
+
+Run the commands from Git Bash, and use `python` (or `py -3`) wherever this tutorial
+says `python3`: on Windows `python3` is usually the Microsoft Store stub. The hooks find
+a working interpreter on their own (`python3`, then `python`, then `py -3`), and the
+installer aborts if none works. Skills are prompts, not programs, so there is nothing
+platform-specific about writing one.
 
 ### Verify it works
 
 ```sh
 git commit --allow-empty -m "test: hook smoke test"
-tail -1 logs/hooks.log
-# → [2026-…] route event=pre-commit dispatched=0 overall=empty outcome=none warnings=0
+tail -3 logs/hooks.log
 git reset --soft HEAD~1      # discard the test commit
 ```
 
-The hook fired, the router found no configured skills, and your commit was untouched.
-By default nothing is routed, so the system is invisible until you add a skill.
+The hook fired and your commit was untouched. The log shows a `route event=pre-commit …`
+line. This repository ships with one skill, `file-counter`, routed **async** on
+`pre-commit` (`config/routes.json`), so the line reports one dispatched skill and a
+detached worker counts the repository's files in the background. That is one real Claude
+run (a few minutes, a few tens of cents on a large repository). Its report lands in
+`_aioutput/file-counter/`. To make the system invisible until you add your own skill,
+empty `routes.pre-commit` in `config/routes.json`.
 
-## 2. Small example: your first skill
+### If a skill fails
 
-A skill is a directory under `skills/` with two files: a `skill.json` manifest and an
-executable `run` that reads the change context (JSON) on stdin and prints a result.
-The full contract is in `specs/005-skill-contract/contracts/skill-contract.md`.
+Failures never block git; they are logged. Look at the newest warning:
+
+```sh
+tail -20 logs/hooks.log
+python3 src/run_records.py show --last
+```
+
+| Message | Meaning |
+|---------|---------|
+| `Not logged in` | the hooks cannot authenticate: set the provider variables from "Claude authentication for the hooks" above and re-run `python3 install.py` from a normal terminal |
+| `unavailable` / CLI too old | `claude` is missing or older than 2.1.287: upgrade it |
+| `timeout` | the skill needed more than its `time_budget_seconds` (max 600) |
+| credentials expired (Bedrock/SSO) | refresh them yourself, e.g. `aws sso login`; the hooks never run `awsAuthRefresh` |
+
+## 2. Your first skill
+
+A skill is a directory under `skills/` with exactly two kinds of file: a `skill.json`
+manifest and a `prompt.md` with the task for Claude. Extra `*.md` files are allowed (notes,
+examples); **any other file — a script, a binary, anything executable — makes the skill
+invalid**. Skills contain no code; the framework is the only thing that runs. The full
+contract is `specs/009-aioutput-skills/contracts/skill-contract.md` (v2.0).
 
 ### Create it
 
 ```sh
-mkdir -p skills/file-counter
+mkdir -p skills/todo-check
 
-cat > skills/file-counter/skill.json <<'EOF'
+cat > skills/todo-check/skill.json <<'EOF'
 {
-  "name": "file-counter",
+  "name": "todo-check",
   "version": "1.0.0",
-  "description": "Reports how many files are in the commit",
+  "description": "Fails the commit if a changed file contains TODO-BLOCK",
   "input": "hook-context@1.0",
-  "output": "skill-result@1.0",
-  "behaviors": {"non_blocking": true, "idempotent": true}
+  "time_budget_seconds": 60
 }
 EOF
 
-cat > skills/file-counter/run <<'EOF'
-#!/bin/sh
-COUNT=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["files"]))')
-printf '{"schema_version": "1.0", "skill": "file-counter", "status": "ok", "summary": "%s file(s) in this change", "details": {}}' "$COUNT"
+cat > skills/todo-check/prompt.md <<'EOF'
+Check each changed file for the marker `TODO-BLOCK`.
+
+The verdict is `fail` if any changed file contains it, otherwise `pass`.
+In the report, list every occurrence as `path:line`, or say that none was found.
 EOF
-chmod +x skills/file-counter/run
 ```
+
+You never ask Claude to write anything. The framework adds the changed files and commits
+to your prompt as the run's focus (Claude may still read any file in the repository), tells Claude it only has read-only tools, and asks for a structured answer:
+a `verdict` (`pass`/`fail`), a one-line `reason`, and a markdown `report`. Say in your prompt
+what makes the verdict `fail` — that is the only thing a block rule ever reacts to.
 
 ### Register and route it
 
 ```sh
-python3 src/skill_registry.py register skills/file-counter
-# → registered 'file-counter' (contract 1.1)
+python3 src/skill_registry.py register skills/todo-check
+python3 src/skill_registry.py list
+# → todo-check 1.0.0 — Fails the commit if a changed file contains TODO-BLOCK
 ```
 
-Then map it to the pre-commit event in `config/routes.json`:
+Then map it to the pre-commit event in `config/routes.json`, and choose its mode:
 
 ```json
 {
-  "version": "1.1",
+  "version": "2.0",
   "routes": {
-    "pre-commit": ["file-counter"],
+    "pre-commit": ["todo-check"],
     "post-merge": [],
     "pre-push": []
   },
-  "outcomes": {},
-  "run_retention": 50
+  "skills": {
+    "todo-check": {"mode": "sync", "on_failure": "block"}
+  },
+  "sync_ceiling_seconds": 120,
+  "run_retention": 50,
+  "output_retention": 50
 }
 ```
+
+Both files are re-read on every git event — no reinstall, no restart.
 
 ### Run it
 
 ```sh
-echo hello > demo.txt && git add demo.txt
+printf 'x = 1  # TODO-BLOCK\n' > demo.py && git add demo.py
 git commit -m "feat: demo"
-python3 src/run_records.py show --last
 ```
 
 ```text
-run      20260719T…Z-pre-commit
-event    pre-commit  branch master  at 2026-07-19T…Z
-context  files=1 commits=0 partial=False
-outcome  NONE
-
-- file-counter: success (48ms) -> none  [rule: default]
-    skill succeeded
-    detail: 1 file(s) in this change
-```
-
-`python3 src/run_records.py list` shows the history of recent runs.
-
-## 3. Worked example: a documentation updater on push
-
-The first skill was deliberately trivial. This one is the real shape of the system: it
-runs on `pre-push`, sends the pushed change set to Claude through the bridge, and writes
-proposed documentation updates into the working tree for review. Everything below was run
-end to end; the sample outputs are real.
-
-### 3.1 The skill
-
-```sh
-mkdir -p skills/doc-updater
-
-cat > skills/doc-updater/skill.json <<'EOF'
-{
-  "name": "doc-updater",
-  "version": "1.0.0",
-  "description": "Proposes documentation updates for the pushed change set",
-  "input": "hook-context@1.0",
-  "output": "skill-result@1.0",
-  "behaviors": {"non_blocking": true, "idempotent": false},
-  "time_budget_seconds": 90
-}
-EOF
-```
-
-`idempotent: false` is the honest declaration here — the output comes from a model, so two
-runs on the same change set are not guaranteed to match. `time_budget_seconds: 90` gives
-the executor room for a Claude call (but see §3.5 — the hook has its own, much shorter cap).
-
-```sh
-cat > skills/doc-updater/run <<'EOF'
-#!/usr/bin/env python3
-"""doc-updater — asks Claude which docs the pushed change set makes stale."""
-import json
-import os
-import subprocess
-import sys
-
-PROPOSALS = "docs/pending-doc-updates.md"
-CODE_SUFFIXES = (".py", ".sh", ".js", ".ts", ".go", ".rs", ".java")
-
-
-def emit(status, summary, details=None, exit_code=0):
-    json.dump({"schema_version": "1.0", "skill": "doc-updater", "status": status,
-               "summary": summary, "details": details or {}}, sys.stdout)
-    sys.exit(exit_code)
-
-
-context = json.load(sys.stdin)
-
-# Constitution 7/8: only code changes can make documentation stale.
-code = [f for f in context["files"] if f.endswith(CODE_SUFFIXES)]
-if not code:
-    emit("skipped", "no code files in this change set")
-
-request = {
-    "schema_version": "1.0",
-    "context": dict(context, files=code),
-    "task": ("For each changed file, name the documentation that now describes "
-             "outdated behavior and state in one line what needs to change. "
-             "Answer 'NONE' if the docs are still accurate. Do not edit files."),
-    "options": {"max_turns": 2},
-}
-root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                      capture_output=True, text=True).stdout.strip()
-proc = subprocess.run([sys.executable, os.path.join(root, "src/claude_bridge.py")],
-                      input=json.dumps(request), capture_output=True, text=True)
-result = json.loads(proc.stdout)
-
-if result["status"] == "unavailable":
-    # Degrade rather than fail: Claude is optional tooling (bridge contract).
-    emit("skipped", "claude CLI unavailable — documentation not checked")
-if result["status"] != "ok":
-    print(f"[doc-updater] bridge {result['status']}: {result['error']}", file=sys.stderr)
-    emit("error", f"bridge {result['status']}", {"error": result["error"]}, exit_code=1)
-
-answer = result["output_text"].strip()
-if answer.upper().startswith("NONE"):
-    emit("ok", f"docs still accurate for {len(code)} changed file(s)")
-
-# Constitution 6/10: propose for review, never overwrite documentation silently.
-os.makedirs(os.path.dirname(PROPOSALS), exist_ok=True)
-with open(PROPOSALS, "w", encoding="utf-8") as fh:
-    fh.write(f"# Pending documentation updates\n\n"
-             f"Branch `{context['branch']}` — {len(code)} changed file(s)\n\n{answer}\n")
-emit("ok", f"proposals written to {PROPOSALS}", {"files": code})
-EOF
-chmod +x skills/doc-updater/run
-```
-
-Three decisions worth copying into your own skills:
-
-- **Narrow the change set before spending a Claude call.** Only code files can invalidate
-  docs; a push of `.md` files exits `skipped` in milliseconds and never invokes Claude.
-- **Decide what an unavailable Claude means.** The bridge reports `unavailable` when the
-  CLI is missing — this skill degrades to `skipped`; a stricter one returns `error` and is
-  routed with `on_failure: block`.
-- **Propose, don't overwrite.** The result is a review file, not an in-place doc rewrite.
-
-### 3.2 Configure it
-
-```sh
-python3 src/skill_registry.py register skills/doc-updater
-# → registered 'doc-updater' (contract 1.1)
-python3 src/skill_registry.py list
-# → doc-updater 1.0.0 — Proposes documentation updates for the pushed change set
-```
-
-Then route it on `pre-push` in `config/routes.json`:
-
-```json
-{
-  "version": "1.1",
-  "routes": {
-    "pre-commit": [],
-    "post-merge": [],
-    "pre-push": ["doc-updater"]
-  },
-  "outcomes": {"doc-updater": {"on_failure": "warn"}},
-  "run_retention": 50
-}
-```
-
-`warn` lets a failing check through with a visible message; `block` refuses the push
-(§3.4). Both files are re-read on every event — no reinstall, no restart.
-
-### 3.3 What happens on `git push`, component by component
-
-| # | Component | What it does |
-|---|-----------|--------------|
-| 1 | `git` → `.githooks/pre-push` | `core.hooksPath` makes git run the shim, which `exec`s `scripts/pre-push.sh`. Git passes the remote on argv and one `<local ref> <local sha> <remote ref> <remote sha>` line per pushed ref on **stdin** |
-| 2 | [`scripts/pre-push.sh`](scripts/pre-push.sh) | Resolves the pushed range (`git rev-list remote_sha..local_sha`, or `--not --remotes` for a new branch), collects files with `git diff-tree`, exports `HOOK_EVENT/BRANCH/FILES/COMMITS`, then runs orchestration under a **5-second** watchdog |
-| 3 | [`scripts/orchestrate.sh`](scripts/orchestrate.sh) | `parse_context.py \| route_workflows.py` — the whole pipeline is this one pipe |
-| 4 | [`src/parse_context.py`](src/parse_context.py) | Environment → context JSON (paths repo-relative, deduped, sorted; commits validated, push order kept) |
-| 5 | [`src/route_workflows.py`](src/route_workflows.py) | Re-reads `routes.json`, selects `routes["pre-push"] → ["doc-updater"]`, hands the plan to the executor |
-| 6 | [`src/execute_skills.py`](src/execute_skills.py) | Resolves the name through `skills/registry.json`, reads the 90 s budget from `skill.json`, runs `skills/doc-updater/run` with the context on stdin |
-| 7 | `skills/doc-updater/run` | Filters to code files, builds a BridgeRequest, writes `docs/pending-doc-updates.md`, prints `skill-result@1.0` |
-| 8 | [`src/claude_bridge.py`](src/claude_bridge.py) | Prompt bounded to *those* files and commits + "do not scan the rest of the repository"; runs `claude -p --output-format json --max-turns 2 --settings {"disableAllHooks":true}` in the repo root, so your `CLAUDE.md` applies and no nested hooks fire |
-| 9 | [`src/run_records.py`](src/run_records.py) | Applies the outcome rule, writes `logs/runs/<id>.json`, prunes to `run_retention` |
-| 10 | `route_workflows` → `_finish_hook` | Exit 0 → push proceeds; exit 10 → `[hook blocked]` and the push is aborted |
-
-Step 4 produces exactly this:
-
-```json
-{"schema_version": "1.0", "event": "pre-push", "branch": "008-run-observability",
- "files": ["src/route_workflows.py", "src/run_records.py"],
- "commits": ["348a98f…aa", "9768e1b…bb"],
- "partial": false, "unavailable": [], "errors": []}
-```
-
-and step 9 leaves this behind:
-
-```text
-run      20260904T101855.838243Z-pre-push
-event    pre-push  branch demo-push-flow  at 2026-09-04T10:18:55Z
-context  files=1 commits=1 partial=False
-outcome  NONE
-
-- doc-updater: success (57ms) -> none  [rule: {"on_failure": "warn"}]
-    skill succeeded
-    detail: proposals written to docs/pending-doc-updates.md
-```
-
-### 3.4 Testing it
-
-Work outwards — each level adds one component, so a failure tells you where it lives.
-
-**Level 1 — the skill alone.** No git, no hooks, no Claude:
-
-```sh
-echo '{"schema_version":"1.0","event":"pre-push","branch":"demo","files":["README.md"],
-       "commits":[],"partial":false,"unavailable":[],"errors":[]}' | skills/doc-updater/run
-# → {"schema_version": "1.0", "skill": "doc-updater", "status": "skipped",
-#    "summary": "no code files in this change set", "details": {}}
-```
-
-**Level 2 — stub the `claude` CLI.** Tests never need a model. Point `claude_command` at a
-script that prints what the real CLI would:
-
-```sh
-mkdir -p /tmp/fakebin
-cat > /tmp/fakebin/claude <<'EOF'
-#!/bin/sh
-printf '{"result": "src/run_records.py: TUTORIAL.md still documents the old retention default."}\n'
-EOF
-chmod +x /tmp/fakebin/claude
-
-cp config/bridge.json config/bridge.json.bak
-python3 - <<'EOF'
-import json
-cfg = json.load(open("config/bridge.json"))
-cfg["claude_command"] = "/tmp/fakebin/claude"
-json.dump(cfg, open("config/bridge.json", "w"), indent=2)
-EOF
-
-echo '{"schema_version":"1.0","event":"pre-push","branch":"demo","files":["src/run_records.py"],
-       "commits":[],"partial":false,"unavailable":[],"errors":[]}' | skills/doc-updater/run
-cat docs/pending-doc-updates.md
-```
-
-Point it at a missing binary to exercise the degrade path, or at a script that `exit 1`s to
-exercise the failure path. Restore with `mv config/bridge.json.bak config/bridge.json`.
-
-**Level 3 — the whole pipeline, still no git.** Fake the hook environment and run
-orchestration directly:
-
-```sh
-HOOK_EVENT=pre-push HOOK_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
-HOOK_FILES="src/run_records.py
-src/route_workflows.py" \
-HOOK_COMMITS="348a98f0000000000000000000000000000000aa" \
-sh scripts/orchestrate.sh
-echo "exit=$?"                       # 0 = proceed, 10 = a block rule matched
-python3 src/run_records.py show --last
-```
-
-**Level 4 — a real push, to a throwaway remote.** Never test hooks against your real
-remote:
-
-```sh
-git init --bare -q /tmp/scratch-remote.git
-git remote add scratch /tmp/scratch-remote.git
-git checkout -b hook-test && echo "def demo(): return 1" > src/demo_touch.py
-git add src/demo_touch.py && git commit -m "demo: touch a code file" src/demo_touch.py
-git push scratch hook-test
-python3 src/run_records.py show --last
-```
-
-Cleanup: `git checkout -; git branch -D hook-test; git remote remove scratch; rm -rf /tmp/scratch-remote.git src/demo_touch.py`.
-
-> `git push --dry-run` also fires the hook and writes a run record — a useful way to
-> re-trigger the pipeline without moving any refs.
-
-**Level 5 — prove the block path.** Set `"on_failure": "block"` and make the bridge fail
-(a stub `claude` that exits 1):
-
-```text
-[hook blocked] skill 'doc-updater': exit 1: [doc-updater] bridge error: claude exited 1: session limit reached
+[hook blocked] skill 'todo-check': demo.py contains TODO-BLOCK (see _aioutput/todo-check/20261002T101530Z-pre-commit.md)
 [hook blocked] git operation aborted by outcome rule
-error: failed to push some refs to '/tmp/scratch-remote.git'
 ```
+
+The full report is in that file, under a provenance header:
+
+```markdown
+---
+skill: "todo-check"
+skill_version: "1.0.0"
+event: "pre-commit"
+branch: "master"
+mode: "sync"
+verdict: "fail"
+reason: "demo.py contains TODO-BLOCK"
+run_id: "20261002T101530.123456Z-pre-commit"
+timestamp: "2026-10-02T10:15:30Z"
+files:
+  - "demo.py"
+---
+
+- demo.py:1 — `x = 1  # TODO-BLOCK`
+```
+
+Remove the marker and commit again: the verdict is `pass`, the commit goes through, and
+nothing at all is printed. `python3 src/run_records.py show --last` shows what ran and why.
+
+## 3. Choosing a mode
+
+| | `sync` | `async` (default) |
+|---|---|---|
+| When it runs | inside the hook; git waits | in a detached worker; the hook returns in milliseconds |
+| Time bound | `min(time_budget_seconds, time left in sync_ceiling_seconds)` | its own `time_budget_seconds` |
+| Can block git | yes — only on `verdict: fail`, only with `on_failure: block`, only on `pre-commit`/`pre-push` | never (a `block` rule is ignored, with a config warning) |
+| Result | `_aioutput/<skill>/…` before git continues | `_aioutput/<skill>/…` a little later |
+| Run record | `logs/runs/<id>.json` | `logs/runs/<id>-async.json`, with `parent_run` |
+
+Rules of thumb:
+
+- **Use `sync` only for gates** — checks whose `fail` must stop the commit or push. Every
+  sync skill adds a Claude call to the developer's wait. All sync skills of one event
+  together get `sync_ceiling_seconds` (default 120, max 600); whatever runs out of time ends
+  as `timeout`, without a call.
+- **Use `async` for everything else** — reviews, summaries, documentation proposals. Read
+  the result in `_aioutput/` when you want it.
+- **Only Claude's judgment can block.** A missing or outdated `claude` CLI, a timeout, an
+  unparseable answer, or an unwritable `_aioutput/` ends the skill as `error` or `timeout`,
+  which is logged and never blocks — even with `on_failure: block`.
+
+`on_failure` values: `block` (above), `warn` (the default: logged to `logs/hooks.log` and
+the run record), `skip` (recorded, nothing logged as a warning).
+
+## 4. What Claude can and cannot do
+
+Every skill call runs the Claude CLI with a fixed, non-configurable confinement:
 
 ```text
-outcome  BLOCK
-
-- doc-updater: failure (91ms) -> block  [rule: {"on_failure": "block"}]
-    rule outcomes.doc-updater.on_failure=block matched status 'failure'
+claude -p --output-format json --max-turns N
+       --restricted --tools Read,Grep,Glob --strict-mcp-config
+       --permission-prompts none --settings {"disableAllHooks": true}
+       --json-schema <verdict schema>
 ```
 
-The push exits 1 and nothing is transferred.
+- **Read-only tools only** (`Read`, `Grep`, `Glob`). No `Write`, `Edit` or `Bash`, no MCP
+  servers, no permission prompts, no nested hooks. Claude cannot modify the project; the
+  framework writes the only file that results from a run.
+- **Your project settings do not widen this.** `--restricted` ignores the project's
+  `.claude/settings.json` allow rules and does not load `CLAUDE.md`. Put everything the
+  skill needs to know into `prompt.md`.
+- **Whole-repository reads, change-set focus (010).** The prompt lists the changed files
+  and commits as the focus of the run and tells Claude it may read any file inside the
+  repository. Claude runs with the repo root as its working directory, and per the CLI
+  docs `--restricted` confines its file tools to that directory. Exclusions (e.g.
+  `.git/`, build output) are your prompt's job.
+- **Secrets are readable.** Gitignored files (`.env`, local credentials, `logs/`) are not
+  hidden from Claude. It cannot change them, but it can quote them into the report in
+  `_aioutput/` (gitignored, yet plain text on disk). Tell a skill not to quote secrets if
+  that matters.
+- `config/bridge.json` accepts only `claude_command`, `model`, `max_turns` and
+  `timeout_seconds`. The old `hooks_enabled` and `extra_args` keys are ignored with a
+  warning — there is no way to pass extra CLI flags.
 
-### 3.5 Two things that will bite this skill
+### Where everything goes
 
-**The hook's 5-second watchdog outranks every other budget.** `_run_with_timeout` in
-[`scripts/lib.sh`](scripts/lib.sh) caps orchestration at 5 s, while the executor default is
-30 s, this manifest asks for 90 s, and `config/bridge.json` allows 120 s. A real Claude call
-loses that race:
+| What | Where | Committed? |
+|---|---|---|
+| Skill reports | `_aioutput/<skill>/<UTC stamp>-<event>[-N].md`, newest `output_retention` kept | no — gitignored |
+| Run records | `logs/runs/<id>.json` (`<id>-async.json` for async) | no |
+| Warnings, one line per routed event, one per async skill | `logs/hooks.log` | no |
+| Terminal output | only `[hook blocked] …` lines | — |
 
-```text
-orchestration exit=143      # SIGTERM from the watchdog
-records written: 0          # the record is written after execution, so there is none
-[hook warning] orchestration failed (exit 143)
-```
+### Testing a skill
 
-The hook then exits 0 and **the push proceeds** — with no record, and with the block rule
-never consulted, because the skill never finished. A Claude-backed skill therefore needs
-that cap raised in `scripts/lib.sh` (and the executor/bridge timeouts kept below the new
-value), or its work moved off the hook's critical path.
-
-**On `pre-push` the commits already exist.** Files the skill writes land as *unstaged*
-working-tree changes; they are not part of the push. That is fine for a proposal file, but
-if you want the docs themselves to travel with the change, route the skill on `pre-commit`,
-where its output can still be staged into the commit. Related: `git rev-list --not --remotes`
-means pushing a branch whose commits another remote already has yields an *empty* change
-set — expected, and visible as `files=0 commits=0` in the run record.
-
-## 4. Where to go next
-
-**Call Claude Code from a skill.** Section 3 does this the long way; the short version is
-one pipe — no Claude-specific code in your skill:
+**Level 1 — run it by hand, sync, no git.** The executor CLI runs any plan synchronously
+and prints the summary, including the path of the result file:
 
 ```sh
-CTX=$(cat)   # inside your skill's run script
-printf '{"schema_version":"1.0","context":%s,"task":"Summarize this change set in one line."}' "$CTX" \
-  | python3 "$(git rev-parse --show-toplevel)/src/claude_bridge.py"
+echo '{"schema_version":"1.0","event":"pre-commit","branch":"demo","files":["demo.py"],
+       "commits":[],"partial":false,"unavailable":[],"errors":[]}' \
+  | python3 src/execute_skills.py todo-check
 ```
 
-The bridge runs `claude` headless with a prompt bounded to the changed files, inherits
-your project's `.claude/settings.json` and `CLAUDE.md`, and returns a structured result
-(`ok` / `error` / `timeout` / `unavailable`). See
-`specs/007-claude-code-bridge/contracts/bridge-interface.md`.
+**Level 2 — the whole pipeline, still no git.** Fake the hook environment:
 
-**Enforce outcomes.** Make a failing skill block the commit instead of just warning:
-
-```json
-"outcomes": {"file-counter": {"on_failure": "block"}}
+```sh
+HOOK_EVENT=pre-commit HOOK_BRANCH=$(git rev-parse --abbrev-ref HEAD) HOOK_FILES="demo.py" \
+sh scripts/orchestrate.sh
+echo "exit=$?"                       # 0 = proceed, 10 = a sync block rule matched
+python3 src/run_records.py show --last
 ```
 
-`block` aborts the git operation with a clear message, `warn` (the default) proceeds
-with a visible warning, `skip` stays silent but still records the failure. Rules take
-effect on the next commit — no reinstall.
+**Level 3 — a real commit or push**, ideally to a throwaway remote
+(`git init --bare /tmp/scratch-remote.git`). `git push --dry-run` also fires the pre-push
+hook without moving any refs.
 
 **Useful commands:**
 
 ```sh
 python3 src/skill_registry.py list          # registered skills
 python3 src/skill_registry.py validate      # re-check all skills against the contract
-python3 src/run_records.py list --limit 10  # recent runs
-tail -20 logs/hooks.log                     # one line per routed event
+python3 src/run_records.py list --limit 10  # recent runs (sync and async)
+ls _aioutput/*/                             # skill reports
+tail -20 logs/hooks.log                     # routed events, warnings, async results
 ```
 
 **Contracts** (each feature's exact schemas): `specs/00N-*/contracts/`.
@@ -457,7 +344,7 @@ constitution ─→ specify ─→ clarify ─→ plan ─→ tasks ─→ imple
 ```
 
 1. **Branch first.** Each feature gets a sequentially numbered branch — `001-installer-setup`
-   … `008-run-observability` — and a matching `specs/00N-<slug>/` directory. Branch name,
+   … `011-installer-claude-check` — and a matching `specs/00N-<slug>/` directory. Branch name,
    spec directory, and commit scope always agree.
 2. **Spec (`spec.md`).** Written in user-story form with priorities (P1/P2/…), acceptance
    scenarios in Given/When/Then, functional requirements (`FR-00N`), and measurable success
@@ -471,9 +358,9 @@ constitution ─→ specify ─→ clarify ─→ plan ─→ tasks ─→ imple
    *deliberate contract change* and land a documented addendum.
 4. **Contracts (`specs/00N-*/contracts/*.md`).** Before code: the exact schemas and CLI
    surfaces the feature exposes — the stable interface other features are allowed to depend
-   on. Every schema carries a version (`hook-context@1.0`, `skill-result@1.0`,
-   `execution-summary@1.0`, `bridge-request/result@1.0`, `run-record@1.0`, routes `1.1`,
-   skill contract `1.1`). Changes are additive; a breaking change bumps the version.
+   on. Every schema carries a version (`hook-context@1.0`,
+   `execution-summary@2.0`, `bridge-request/result@2.0`, `run-record@1.1`, routes `2.0`,
+   skill contract `2.0`). Changes are additive; a breaking change bumps the version.
 5. **Tasks (`tasks.md`).** The plan cut into numbered tasks, each naming the files it
    touches and the interfaces it produces. Every task is the same five-step checklist:
    **① write failing tests → ② verify they fail → ③ implement → ④ verify they pass →
@@ -492,13 +379,13 @@ constitution ─→ specify ─→ clarify ─→ plan ─→ tasks ─→ imple
 | Commits | Conventional Commits, scoped by feature number: `feat(006): skill executor engine…`, `docs(008): contract addenda…` |
 | Language | Python 3.10+ **stdlib only** at runtime; POSIX `sh` (`#!/bin/sh`, no bash-isms) for hooks |
 | Dev tooling | `pytest` + `ruff` in a throwaway `.venv` — never a runtime dependency |
-| Exit codes | Every pipeline component exits **0**, even on bad input. Exit **10** is the single reserved "a block rule matched" signal (008) |
-| I/O | Components are CLIs that speak JSON on stdin/stdout and warnings on stderr, so each is testable and runnable in isolation |
+| Exit codes | Every pipeline component exits **0**, even on bad input. Exit **10** is the single reserved "a sync block rule matched" signal (008/009) |
+| I/O | Components are CLIs that speak JSON on stdin/stdout, so each is testable and runnable in isolation. Hook-time warnings go to `logs/hooks.log`; the terminal shows only blocks |
 | Composition | Small scripts, one responsibility each; logic lives in versioned files, never inline in hook config |
 
 The design rules behind those conventions are project law in
 `.specify/memory/constitution.md` (16 principles — incremental change sets only, git as the
-change authority, bounded Claude context, spec before automation, safe by default,
+change authority, a change-set focus for Claude (read-only, whole repo readable), spec before automation, safe by default,
 structured I/O, idempotency, observable execution). Specs and plans must demonstrate
 compliance before implementation starts; when a convenience conflicts with the
 constitution, the constitution wins.
@@ -506,8 +393,8 @@ constitution, the constitution wins.
 ### Working on it yourself
 
 ```sh
-git checkout -b 009-my-feature          # branch = spec dir = commit scope
-mkdir -p specs/009-my-feature/contracts # spec.md, plan.md, tasks.md, contracts/ live here
+git checkout -b 012-my-feature          # branch = spec dir = commit scope
+mkdir -p specs/012-my-feature/contracts # spec.md, plan.md, tasks.md, contracts/ live here
 uv venv .venv && uv pip install -p .venv/bin/python pytest ruff
 .venv/bin/pytest tests/ -q              # red first, then implement
 .venv/bin/ruff check src/
@@ -515,28 +402,39 @@ uv venv .venv && uv pip install -p .venv/bin/python pytest ruff
 
 ## 6. Component reference
 
-Eight features, each self-contained, each with its own spec directory, contract, and test
-file. The runtime pipeline is: **hooks → parser → router → executor → skills (→ bridge) →
-run records**.
+Eleven features, each with its own spec directory and (mostly) a contract and test file. The runtime
+pipeline is: **hooks → parser → router → executor → bridge (Claude, read-only) →
+`_aioutput/` + run records**, with async skills handed to a detached worker. Feature 009
+reshaped 002 and 005–008; their sections below describe the current behavior. 010 and 011
+are cross-cutting changes to 007 and 001 and have no section of their own.
 
 | # | Component | Files | Role |
 |---|---|---|---|
 | 001 | Installer | `install.py` | Validate prerequisites, wire up git hooks |
 | 002 | Git hooks | `.githooks/*`, `scripts/*.sh` | Capture the event, delegate, never break git |
 | 003 | Context parser | `src/parse_context.py` | Raw env → normalized JSON context |
-| 004 | Router | `src/route_workflows.py`, `config/routes.json` | Event → execution plan |
-| 005 | Skill contract & registry | `src/skill_registry.py`, `skills/registry.json` | Validate and catalog skills |
-| 006 | Executor | `src/execute_skills.py` | Run skills, isolated and time-bounded |
-| 007 | Claude bridge | `src/claude_bridge.py`, `config/bridge.json` | Single bounded entry point to Claude Code |
+| 004 | Router | `src/route_workflows.py`, `config/routes.json` | Event → plan with per-skill modes |
+| 005 | Skill contract & registry | `src/skill_registry.py`, `skills/registry.json` | Validate and catalog prompt skills |
+| 006 | Executor | `src/execute_skills.py`, `src/async_worker.py` | Run sync skills, dispatch async ones |
+| 007 | Claude bridge | `src/claude_bridge.py`, `config/bridge.json` | Single, read-only entry point to Claude Code |
 | 008 | Observability & outcomes | `src/run_records.py`, `logs/runs/` | Record every run, enforce block/warn/skip |
+| 009 | Result files | `src/ai_output.py`, `_aioutput/` | Write each skill's report, with history |
+| 010 | Repo-wide read context | `src/claude_bridge.py`, `src/execute_skills.py` | Claude may read the whole repo (still read-only); the change set is the focus |
+| 011 | Installer Claude check | `install.py` | Abort the install unless Claude can run as the hooks run it |
 
 ### 001 — Installer (`install.py`)
 
 Stdlib-only, run once from anywhere inside the target repo. Guards the Python version before
-any other import, checks prerequisites (git, Python 3.10+, uv, optionally the `claude` CLI),
-creates required directories, points `git config core.hooksPath` at the versioned
-`.githooks/`, and marks the hook scripts executable. No daemon, no background process — the
-whole install is git configuration.
+any other import, checks prerequisites (git, Python 3.10+, uv, and the `claude` CLI at
+2.1.287 or later), creates required directories, points `git config core.hooksPath` at the
+versioned `.githooks/`, and marks the hook scripts executable. No daemon, no background
+process: the whole install is git configuration.
+
+Since 011, it also checks that Claude can run the way the hooks run it. A static check
+lists the provider variables that are set in `~/.claude/settings.json` but missing from the
+environment, by name only. A live call uses the hooks' exact `--restricted` confinement. If
+the check fails, the install aborts before changing anything and names the variables to set.
+`--skip-claude-check` skips the live call. See §1, "Claude authentication for the hooks".
 
 ### 002 — Git hook scripts (`.githooks/`, `scripts/`)
 
@@ -550,13 +448,14 @@ Two layers, deliberately: `.githooks/<event>` is a two-line shim that `exec`s
 - `scripts/pre-push.sh` — reads git's ref lines on stdin, resolves the pushed revision range
   (handling the all-zeros new-branch case), and exports both `HOOK_COMMITS` and the union of
   files across those commits.
-- `scripts/lib.sh` — shared helpers, sourced not executed: `_run_with_timeout` (5 s;
+- `scripts/lib.sh` — shared helpers, sourced not executed: `_run_with_timeout`
+  (`HOOK_CEILING_SECONDS=610`, a backstop above the router's sync ceiling;
   `timeout`/`gtimeout`, falling back to a POSIX watchdog subshell) and `_finish_hook`, which
   implements the exit-code protocol — **10 → abort the git operation** with
-  `[hook blocked]`; any other non-zero → `[hook warning]` and exit 0.
-- `scripts/orchestrate.sh` — the 8-line entry point: `parse_context.py | route_workflows.py`.
+  `[hook blocked]`; any other non-zero → one line in `logs/hooks.log` and exit 0.
+- `scripts/orchestrate.sh` — the entry point: `parse_context.py | route_workflows.py`.
 
-Invariant: a broken, missing, or slow orchestration can only ever *warn*.
+Invariant: a broken, missing, or slow orchestration can only ever be *logged*.
 
 ### 003 — Hook context parser (`src/parse_context.py`)
 
@@ -568,64 +467,72 @@ unavailability markers rather than a silent omission. Always exits 0.
 
 ### 004 — Workflow router (`src/route_workflows.py`, `config/routes.json`)
 
-Reads the context on stdin, re-reads `config/routes.json` **fresh on every invocation** (so
-editing routes takes effect on the next commit, no reinstall), builds the execution plan for
-that event, and hands it to the executor. Emits a `DispatchResult` v1.2 on stdout embedding
-the ExecutionSummary, appends one line per event to `logs/hooks.log`, and applies the 008
-outcome evaluation. Config loading is tolerant: a malformed or missing file degrades to an
-empty routing table plus a warning. Exits 0 — except exit 10 when a block rule matched.
+Reads the context on stdin, re-reads `config/routes.json` (v2.0) **fresh on every
+invocation**, builds the plan for that event with each skill's mode from
+`skills.<name>.mode`, and hands it to the executor. Emits a `DispatchResult` v2.0 on stdout,
+appends one line per event plus one per warning to `logs/hooks.log`, and applies the 008
+outcome evaluation. The terminal stays silent except for `[hook blocked]` lines. Config
+loading is tolerant: a malformed or missing file degrades to an empty routing table plus a
+logged warning; the v1.x `outcomes` key is still read, with a deprecation warning. Exits 0 —
+except exit 10 when a sync block rule matched.
 
 ### 005 — Skill contract & registry (`src/skill_registry.py`, `skills/registry.json`)
 
-The contract (`specs/005-skill-contract/contracts/skill-contract.md`, v1.1) defines what a
-skill is: a directory with `skill.json` (name, semver, description, `input:
-hook-context@1.0`, `output: skill-result@1.0`, behaviors, optional `time_budget_seconds`) and
-an executable `run`. `skill_registry.py` validates manifests — name pattern, reserved names,
-semver, required schema versions, budget ceiling of 600 s — and reports **all** violations in
-one pass rather than the first. CLI: `register` / `deregister` / `resolve` / `list` /
-`validate`. The router resolves identifiers only through `skills/registry.json`.
+The contract (v2.0, `specs/009-aioutput-skills/contracts/skill-contract.md`) defines a skill
+as a directory with `skill.json` (name, semver, description, `input: hook-context@1.0`,
+optional `time_budget_seconds` ≤ 600) and a non-empty `prompt.md`. Any file other than
+`skill.json` and `*.md` — or any file with the executable bit — is a violation.
+`skill_registry.py` reports **all** violations in one pass. CLI: `register` / `deregister` /
+`resolve` / `list` / `validate`. The router resolves identifiers only through
+`skills/registry.json`, and the executor re-validates a skill before every run.
 
-### 006 — Skill executor (`src/execute_skills.py`)
+### 006 — Skill executor (`src/execute_skills.py`, `src/async_worker.py`)
 
-Runs the ordered plan. Each skill receives the unmodified context JSON on stdin, in its own
-subprocess, under a time budget (default 30 s, per-skill override up to 600 s). Failures are
-isolated — one skill crashing, timing out, or being unresolvable never stops the rest. Every
-skill lands in one of four statuses: `success` / `failure` / `timeout` / `skipped`, with a
-duration and a diagnostic detail. Produces an `execution-summary@1.0` and always exits 0.
+Dispatches the async part of the plan first — one job file in `logs/async/` and one detached
+`async_worker.py` process, so git never waits — then runs the sync skills in order, each
+under `min(budget, time left in the sync ceiling)` (default budget 60 s). Each skill is one
+bridge call followed by one result file. Statuses: `success` / `failure` (verdict `fail`) /
+`error` / `timeout` / `skipped` / `dispatched` / `dispatch-failed`. Failures are isolated;
+the executor never raises. The worker runs its skills with full budgets, writes its own run
+record and one `logs/hooks.log` line per skill, and deletes the job file.
 
 ### 007 — Claude Code bridge (`src/claude_bridge.py`, `config/bridge.json`)
 
-The only place that knows how to call Claude. A skill pipes a `BridgeRequest`
-(`{schema_version, context, task}`); the bridge builds a prompt **bounded to the changed
-files** — with an explicit instruction not to enumerate the rest of the repository
-(constitution principle 3) — runs `claude -p --output-format json` headless in the current
-directory so the project's own `.claude/settings.json` and `CLAUDE.md` apply, and returns a
-`BridgeResult`: `ok` / `error` / `timeout` / `unavailable`. Config: `claude_command`,
-`max_turns` (4), `timeout_seconds` (120), `hooks_enabled` (false — prevents recursive hook
-triggering), `extra_args`. Always exits 0; the calling skill decides its own outcome.
+The only place that knows how to call Claude. It builds a prompt **focused on the changed
+files** (the whole repository is readable since 010), runs Claude in the repo root, sends
+it on stdin to `claude -p` with the fixed read-only confinement (§4), and
+parses the structured `{verdict, reason, report}` answer into a `bridge-result@2.0`: `ok` /
+`error` / `timeout` / `unavailable` / `bad-request`. A CLI older than 2.1.287 (which lacks
+the confinement flags) is `unavailable`, never run unconfined. Config: `claude_command`,
+`model`, `max_turns` (20), `timeout_seconds` (120).
 
 ### 008 — Run observability & outcome enforcement (`src/run_records.py`, `logs/runs/`)
 
 Three jobs in one module:
 
-- **Evaluate.** Each skill result is mapped to an outcome against
-  `routes.json → outcomes.<skill>.on_failure`. Default is **warn** (safe by default); `block`
-  is opt-in per skill; an invalid rule degrades to warn with a note. The run's final outcome
-  is the strongest of them (`block > warn > none`). Only `pre-commit` and `pre-push` can
-  block — a block on `post-merge` is downgraded (the merge already happened) and flagged
-  `block_downgraded`.
-- **Record.** Every run — including empty plans — writes `logs/runs/<timestamp>-<event>.json`
-  (`run-record@1.0`) with event, branch, timestamp, per-skill status/duration/rule/outcome/
-  reason, and the final outcome. Writes are best-effort and gitignored: an unwritable
-  directory returns `None` rather than raising, so observability can never affect the git
-  operation. Retention (default 50) prunes oldest first.
-- **Report.** CLI `list [--limit N]` (one line per run, newest first) and `show <id>|--last`
-  (full render with reasons).
+- **Evaluate.** Each result is mapped to an outcome against `skills.<name>.on_failure`.
+  Default is **warn**; `block` applies only to a sync skill's `failure` on `pre-commit` or
+  `pre-push` — anything else that asks for a block is downgraded to warn and flagged
+  `block_downgraded`, with the reason. The run's final outcome is the strongest
+  (`block > warn > none`).
+- **Record.** Every run — including empty plans — writes `logs/runs/<id>.json`
+  (`run-record@1.1`) with per-skill mode, status, verdict, output file, duration, rule,
+  outcome and reason. Async workers write `<id>-async.json` with `parent_run`. Writes are
+  best-effort; retention (default 50) prunes oldest first.
+- **Report.** CLI `list [--limit N]` and `show <id>|--last`.
+
+### 009 — Result files (`src/ai_output.py`, `_aioutput/`)
+
+The framework, never Claude, writes each skill's report to
+`_aioutput/<skill>/<YYYYMMDDTHHMMSSZ>-<event>[-N].md` with a JSON-valued provenance header.
+Files are reserved with an exclusive create and written atomically, never overwritten, and
+pruned to `output_retention` per skill. `_aioutput/` is gitignored.
 
 ### Tests (`tests/`)
 
-One pytest file per component, ~1,400 lines total, written before the code they cover:
-`test_parse_context.py`, `test_route_workflows.py`, `test_skill_registry.py`,
-`test_execute_skills.py`, `test_claude_bridge.py`, `test_run_records.py`. They assert against
-the contracts and the numbered acceptance criteria, not against implementation details — so
-a component can be rewritten as long as its contract holds.
+One pytest file per component, written before the code they cover:
+`test_install.py`, `test_parse_context.py`, `test_route_workflows.py`,
+`test_skill_registry.py`, `test_execute_skills.py`, `test_async_worker.py`,
+`test_claude_bridge.py`, `test_ai_output.py`, `test_run_records.py`. Claude is never called:
+the bridge and the async dispatch are injected. They assert against the contracts and the
+numbered acceptance criteria, not against implementation details.

@@ -3,11 +3,14 @@
 
 Reads a hook context (003 schema) on stdin, loads config/routes.json fresh on
 every invocation, selects the execution plan for the event, and hands it to
-the skill executor (execute_skills). Emits a DispatchResult v1.1 JSON on
-stdout (embedding the ExecutionSummary), warnings on stderr, and always exits
-0 so routing can never abort the triggering git operation. Contracts:
+the skill executor (execute_skills) with each skill's mode. Emits a
+DispatchResult v2.0 JSON on stdout (embedding the ExecutionSummary). Since 009
+the terminal stays silent: warnings go to logs/hooks.log and the run record,
+and the only stderr output is a `[hook blocked]` line when a sync skill's
+block rule matched (exit 10). Every other path exits 0. Contracts:
 specs/004-workflow-router/contracts/routing-config.md,
-specs/006-skill-executor/contracts/execution-summary.md
+specs/006-skill-executor/contracts/execution-summary.md,
+specs/009-aioutput-skills/contracts/execution-and-output.md
 """
 from __future__ import annotations
 
@@ -17,37 +20,97 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from execute_skills import execute_plan
+from ai_output import DEFAULT_OUTPUT_RETENTION
+from claude_bridge import invoke as bridge_invoke
+from claude_bridge import load_bridge_config
+from execute_skills import (
+    DEFAULT_MODE,
+    DEFAULT_SYNC_CEILING,
+    MAX_BUDGET_SECONDS,
+    MODES,
+    dispatch_async,
+    execute_plan,
+)
 from run_records import (
     BLOCK_EXIT_CODE,
     DEFAULT_RETENTION,
-    DEFAULT_RUNS_DIR,
     build_run_record,
     evaluate_outcomes,
+    new_run_id,
     write_run_record,
 )
 
-RESULT_SCHEMA_VERSION = "1.2"   # DispatchResult: 1.0 → 1.1 (006) → 1.2 (008)
+# DispatchResult: 1.0 → 1.1 (006) → 1.2 (008) → 2.0 (009: modes, verdicts,
+# result files; warnings no longer printed)
+RESULT_SCHEMA_VERSION = "2.0"
 OUTCOMES = ("invoked", "unresolvable", "failed")  # router-level vocabulary
 VALID_EVENTS = ("pre-commit", "post-merge", "pre-push")
 DEFAULT_CONFIG = "config/routes.json"
 DEFAULT_SKILLS_DIR = "skills"
 # Executor statuses (006) collapse into the router's coarser vocabulary (004),
 # which the DispatchResult has exposed since before the executor existed.
-_STATUS_TO_OUTCOME = {"success": "invoked", "skipped": "unresolvable",
-                      "failure": "failed", "timeout": "failed"}
+_STATUS_TO_OUTCOME = {"success": "invoked", "dispatched": "invoked",
+                      "skipped": "unresolvable", "failure": "failed",
+                      "error": "failed", "timeout": "failed",
+                      "dispatch-failed": "failed"}
+
+
+def _positive_int(raw: dict, key: str, default: int, warnings: list[str]) -> int:
+    value = raw.get(key, default)
+    # isinstance(True, int) is True in Python — exclude bools explicitly.
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        warnings.append(f"routing config: '{key}' must be a positive integer — using default")
+        return default
+    return value
+
+
+def _skill_rules(raw: dict, warnings: list[str]) -> dict:
+    """routes v2.0 `skills` (+ the v1.x `outcomes` fallback) → {name: rule}.
+
+    Rule values are validated here only as far as shape and mode go; an
+    invalid on_failure is kept so evaluate_outcomes can note it per run.
+    """
+    skills = raw.get("skills", {})
+    if not isinstance(skills, dict) or not all(isinstance(v, dict) for v in skills.values()):
+        warnings.append("routing config: 'skills' must be an object of rule objects — ignoring")
+        skills = {}
+    rules = {name: dict(rule) for name, rule in skills.items()}
+
+    legacy = raw.get("outcomes", {})
+    if not isinstance(legacy, dict) or not all(isinstance(v, dict) for v in legacy.values()):
+        warnings.append("routing config: 'outcomes' must be an object of rule objects — ignoring")
+        legacy = {}
+    if legacy:
+        warnings.append("routing config: 'outcomes' is deprecated — move on_failure "
+                        "into skills.<name> (routes v2.0)")
+    for name, rule in legacy.items():
+        if "on_failure" in rule:
+            rules.setdefault(name, {}).setdefault("on_failure", rule["on_failure"])
+
+    for name, rule in rules.items():
+        if "mode" in rule and rule["mode"] not in MODES:
+            warnings.append(f"routing config: skill '{name}' has invalid mode "
+                            f"{rule['mode']!r} — using {DEFAULT_MODE}")
+            del rule["mode"]
+        rule.setdefault("mode", DEFAULT_MODE)
+        if rule.get("on_failure") == "block" and rule["mode"] != "sync":
+            warnings.append(f"routing config: skill '{name}' is async — "
+                            "on_failure=block is ignored (only sync skills block)")
+    return rules
 
 
 def load_config(path: str, warnings: list[str]) -> dict:
     """Read and sanitize config/routes.json; never raise.
 
-    Read fresh on every invocation (SC-005) so editing routes or outcome rules
+    Read fresh on every invocation (SC-005) so editing routes or skill rules
     takes effect on the next git event with no reinstall. Every validation
     problem degrades to "route nothing" plus a warning rather than an error:
     a typo in the config must not be able to break someone's commit.
     """
-    empty = {"version": "1.0", "routes": {}, "outcomes": {},
-             "run_retention": DEFAULT_RETENTION}
+    empty = {"version": "2.0", "routes": {}, "skills": {},
+             "sync_ceiling_seconds": DEFAULT_SYNC_CEILING,
+             "run_retention": DEFAULT_RETENTION,
+             "output_retention": DEFAULT_OUTPUT_RETENTION}
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -75,26 +138,19 @@ def load_config(path: str, warnings: list[str]) -> dict:
             warnings.append(f"routing config: route for '{event}' must be a list of strings — treating as empty")
             clean[event] = []
 
-    # routes v1.1: {"<skill>": {"on_failure": "block"|"warn"|"skip"}} (008).
-    # Individual rule values are validated later, at evaluation time.
-    outcomes = raw.get("outcomes", {})
-    if not isinstance(outcomes, dict) or not all(
-            isinstance(v, dict) for v in outcomes.values()):
-        if outcomes != {}:
-            warnings.append("routing config: 'outcomes' must be an object of "
-                            "rule objects — ignoring")
-        outcomes = {}
-
-    retention = raw.get("run_retention", DEFAULT_RETENTION)
-    # isinstance(True, int) is True in Python — exclude bools explicitly.
-    if not isinstance(retention, int) or isinstance(retention, bool) or retention < 1:
-        if retention != DEFAULT_RETENTION:
-            warnings.append("routing config: 'run_retention' must be a positive "
-                            "integer — using default")
-        retention = DEFAULT_RETENTION
+    ceiling = raw.get("sync_ceiling_seconds", DEFAULT_SYNC_CEILING)
+    if (not isinstance(ceiling, (int, float)) or isinstance(ceiling, bool)
+            or not 1 <= ceiling <= MAX_BUDGET_SECONDS):
+        warnings.append(f"routing config: 'sync_ceiling_seconds' must be 1–"
+                        f"{MAX_BUDGET_SECONDS} — using {DEFAULT_SYNC_CEILING:g}")
+        ceiling = DEFAULT_SYNC_CEILING
 
     return {"version": raw.get("version", "1.0"), "routes": clean,
-            "outcomes": outcomes, "run_retention": retention}
+            "skills": _skill_rules(raw, warnings),
+            "sync_ceiling_seconds": float(ceiling),
+            "run_retention": _positive_int(raw, "run_retention", DEFAULT_RETENTION, warnings),
+            "output_retention": _positive_int(raw, "output_retention",
+                                              DEFAULT_OUTPUT_RETENTION, warnings)}
 
 
 def select_plan(context: dict, config: dict, warnings: list[str]) -> list[str]:
@@ -140,8 +196,8 @@ def route(context: dict, config: dict, invoker) -> dict:
 def _log_summary(log_path: str, result: dict) -> None:
     """Append one human-scannable line per event to logs/hooks.log.
 
-    A coarse "did anything run?" trail. The full detail lives in the run record
-    written by feature 008; this is what `tail -1 logs/hooks.log` shows.
+    A coarse "did anything run?" trail, followed by one line per warning. The
+    full detail lives in the run record written by feature 008.
     """
     try:
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
@@ -155,24 +211,34 @@ def _log_summary(log_path: str, result: dict) -> None:
                      f"overall={result.get('overall', 'n/a')} "
                      f"outcome={result.get('final_outcome', 'n/a')} "
                      f"warnings={len(result['warnings'])}\n")
+            # The terminal stays silent since 009, so this is where warnings
+            # are read.
+            fh.writelines(f"[{stamp}] warning {w}\n" for w in result["warnings"])
     except OSError:
         pass  # logging must never break routing
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, bridge=bridge_invoke,
+         dispatch=dispatch_async) -> int:
     """CLI: context JSON on stdin -> DispatchResult on stdout.
 
     The full runtime pipeline lives here: load config → select plan → execute
-    (006) → evaluate outcomes + write the run record (008). Exit code is 0,
-    except BLOCK_EXIT_CODE (10) when a configured block rule matched — the one
-    signal scripts/lib.sh translates into aborting the git operation.
+    (006/009: async dispatched, sync run) → evaluate outcomes + write the run
+    record (008). Exit code is 0, except BLOCK_EXIT_CODE (10) when a sync
+    skill's block rule matched — the one signal scripts/lib.sh translates into
+    aborting the git operation. bridge/dispatch are injectable for tests.
     """
     parser = argparse.ArgumentParser(description="Route a hook context to configured workflows")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--log", default=None)
     parser.add_argument("--skills-dir", default=DEFAULT_SKILLS_DIR)
-    parser.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR)
+    parser.add_argument("--root", default=".", help="repository root (for _aioutput/, logs/)")
+    parser.add_argument("--runs-dir", default=None, help="default: <root>/logs/runs")
+    parser.add_argument("--bridge-config", default=None,
+                        help="default: <root>/config/bridge.json")
     args = parser.parse_args(argv)
+    root = os.path.abspath(args.root)
+    runs_dir = args.runs_dir or os.path.join(root, "logs", "runs")
 
     warnings: list[str] = []
     try:
@@ -189,42 +255,56 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     try:
         plan = select_plan(context, config, warnings)
-        summary = execute_plan(plan, context, args.skills_dir)
-        evaluation = evaluate_outcomes(summary, config["outcomes"],
-                                       context.get("event"))
-        record = build_run_record(context, plan, summary, evaluation, warnings)
-        record_path = write_run_record(args.runs_dir, record,
-                                       config["run_retention"])
+        # The id is needed before the run ends: it names the async job and is
+        # written into every result file.
+        run_id = new_run_id(context.get("event"))
+        bridge_config = load_bridge_config(
+            args.bridge_config or os.path.join(root, "config", "bridge.json"),
+            warnings) if plan else None
+        rules = config["skills"]
+        summary = execute_plan(
+            plan, context, skills_dir=args.skills_dir, root=root, run_id=run_id,
+            modes={s: rules.get(s, {}).get("mode", DEFAULT_MODE) for s in plan},
+            sync_ceiling=config["sync_ceiling_seconds"], bridge_config=bridge_config,
+            output_retention=config["output_retention"],
+            jobs_dir=os.path.join(root, "logs", "async"), runs_dir=runs_dir,
+            log_path=os.path.abspath(args.log) if args.log else None,
+            outcome_rules=rules, run_retention=config["run_retention"],
+            bridge=bridge, dispatch=dispatch)
+        evaluation = evaluate_outcomes(summary, rules, context.get("event"))
+        record = build_run_record(context, plan, summary, evaluation, warnings,
+                                  run_id=run_id)
+        record_path = write_run_record(runs_dir, record, config["run_retention"])
 
-        # Re-shape the evaluated results into the DispatchResult vocabulary,
-        # surfacing anything ruled "warn" on stderr where the developer sees it.
         results = []
         for r in evaluation["results"]:
             outcome = _STATUS_TO_OUTCOME.get(r["status"], "failed")
             if r["outcome"] == "warn":
                 warnings.append(f"workflow '{r['skill']}' {outcome}: {r['detail']}")
-            results.append({"workflow": r["skill"], "outcome": outcome,
-                            "status": r["status"], "detail": r["detail"],
-                            "duration_ms": r["duration_ms"]})
+            results.append({"workflow": r["skill"], "mode": r["mode"],
+                            "outcome": outcome, "status": r["status"],
+                            "verdict": r["verdict"], "output_file": r["output_file"],
+                            "detail": r["detail"], "duration_ms": r["duration_ms"]})
 
         # Every blocking skill is named — the developer should not have to
         # re-run to discover the second reason their commit was refused.
         blocking = [r for r in evaluation["results"] if r["outcome"] == "block"]
         for b in blocking:
-            print(f"[hook blocked] skill '{b['skill']}': {b['detail']}",
+            see = f" (see {b['output_file']})" if b["output_file"] else ""
+            print(f"[hook blocked] skill '{b['skill']}': {b['detail']}{see}",
                   file=sys.stderr)
         if blocking:
             exit_code = BLOCK_EXIT_CODE
 
-        result = {"schema_version": RESULT_SCHEMA_VERSION,
+        result = {"schema_version": RESULT_SCHEMA_VERSION, "run_id": run_id,
                   "event": context.get("event"), "overall": summary["overall"],
                   "final_outcome": evaluation["final_outcome"],
                   "results": results, "outcomes": evaluation["results"],
                   "execution": summary, "run_record": record_path,
                   "warnings": evaluation.get("notes", [])}
     except Exception as exc:  # SC-004: only a matched block rule may abort git
-        # A router crash is reported as a warning and exit 0 — never a block.
-        result = {"schema_version": RESULT_SCHEMA_VERSION,
+        # A router crash is logged and exits 0 — never a block.
+        result = {"schema_version": RESULT_SCHEMA_VERSION, "run_id": None,
                   "event": context.get("event"), "overall": "failure",
                   "final_outcome": "warn", "results": [], "outcomes": [],
                   "execution": None, "run_record": None,
@@ -232,8 +312,6 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 0
     result["warnings"] = warnings + result["warnings"]
 
-    for w in result["warnings"]:
-        print(f"[router warning] {w}", file=sys.stderr)
     if args.log:
         _log_summary(args.log, result)
     json.dump(result, sys.stdout)

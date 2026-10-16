@@ -19,3 +19,6 @@ build/
 
 # Project
 logs/
+
+# Feature 009: skill results written by the framework (local output, never committed)
+_aioutput/

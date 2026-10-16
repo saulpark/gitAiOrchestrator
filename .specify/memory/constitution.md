@@ -8,6 +8,7 @@ This project exists to keep technical documentation aligned with source code cha
 ### 1. Incremental First
 Documentation updates must be based on the smallest valid change set, using Git diffs, changed paths, commit ranges, or patch context.
 Full repository scans are forbidden unless explicitly requested for migration, repair, or baseline regeneration.
+Read-only analysis by Claude may consult the whole repository; the change set defines what triggered the run and what it focuses on. Writes remain limited to framework-owned outputs (`_aioutput/`). (Amended by 010.)
 
 ### 2. Git Is The Change Authority
 Git events are the canonical trigger for detecting repository changes.
@@ -15,7 +16,7 @@ Push events must determine what changed before any documentation agent runs.
 
 ### 3. Claude Is The Documentation Engine
 Claude Code may analyze changed files, generate or update documentation, validate consistency, and propose edits.
-Claude Code must receive bounded context derived from the detected change set and must not operate on the entire repository by default.
+Claude Code must receive the detected change set as the focus of each run; it may read the entire repository but never modify it. (Amended by 010.)
 
 ### 4. Spec Before Automation
 Any new automation flow must be defined through Spec Kit artifacts before implementation.
@@ -35,6 +36,7 @@ Unrelated files must not be rewritten for style-only drift unless explicitly req
 
 ### 8. Explicit Exclusions
 Generated folders, vendored code, lockfiles, build artifacts, caches, binaries, and temporary files must be excluded from documentation analysis unless a spec explicitly overrides this.
+Spec 010 overrides this for reading: Claude may read any file in the repository, and exclusions are each skill's own responsibility.
 
 ### 9. Validation Required
 Every documentation update workflow must include validation.

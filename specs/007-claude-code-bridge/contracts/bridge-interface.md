@@ -1,5 +1,7 @@
 # Contract: Bridge Interface
 
+> **Superseded in part by 009** — bridge `2.0` always runs Claude read-only (fixed confinement flags), returns a structured verdict, and drops `hooks_enabled`/`extra_args`. See `specs/009-aioutput-skills/contracts/execution-and-output.md`.
+
 **Branch**: `007-claude-code-bridge` | **Date**: 2026-07-19
 **Schema versions**: bridge-request `1.0`, bridge-result `1.0`, bridge config `1.0`
 
@@ -78,7 +80,8 @@ python3 "$(git rev-parse --show-toplevel)/src/claude_bridge.py" < request.json
 The prompt the bridge builds contains exactly: event, branch, changed files, commits,
 partiality notes, the skill's task, and the constraint sentence
 *"Only examine the files listed above. Do not scan or enumerate the rest of the
-repository."* Nothing else is injected; the project's CLAUDE.md/settings are applied by
+repository."* (Replaced by 010 with a scope sentence that allows reading the whole
+repository — see `specs/010-repo-wide-context/plan.md`.) Nothing else is injected; the project's CLAUDE.md/settings are applied by
 Claude Code itself via cwd (FR-004).
 
 ## Non-Goals

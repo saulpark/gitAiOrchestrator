@@ -1,8 +1,7 @@
 {
-  "version": "1.0",
+  "version": "2.0",
   "claude_command": "claude",
-  "max_turns": 4,
-  "timeout_seconds": 120,
-  "hooks_enabled": false,
-  "extra_args": []
+  "model": "",
+  "max_turns": 20,
+  "timeout_seconds": 120
 }

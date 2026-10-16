@@ -33,14 +33,19 @@ def _normalize_paths(raw: str, repo_root: str, errors: list[str]) -> list[str]:
         if not p:
             continue
         if os.path.isabs(p):
-            rel = os.path.relpath(p, repo_root)
+            try:
+                rel = os.path.relpath(p, repo_root)
+            except ValueError:
+                rel = ".."  # Windows: another drive is outside by definition
             # A relative path starting with ".." escapes the repo — never pass
             # it on; skills are only ever allowed to see in-repo files.
             if rel == ".." or rel.startswith(".." + os.sep):
                 errors.append(f"path outside repository dropped: {p}")
                 continue
             p = rel
-        paths.add(os.path.normpath(p))
+        # The contract (and git) use "/" on every platform; normpath would
+        # hand Windows consumers "src\foo.py" and break string comparisons.
+        paths.add(os.path.normpath(p).replace(os.sep, "/"))
     return sorted(paths)
 
 
