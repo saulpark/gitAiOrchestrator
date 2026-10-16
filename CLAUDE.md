@@ -33,6 +33,7 @@ cd src && pytest && ruff check .
 Python 3.10+: Follow standard conventions
 
 ## Recent Changes
+- fix-windows-timeout: `scripts/lib.sh` `_gnu_timeout` — hooks ignore a non-GNU `timeout` (Windows `System32	imeout.exe`) and use the POSIX watchdog
 - 011-installer-claude-check: install.py aborts unless Claude runs under the hooks' `--restricted` confinement; TUTORIAL §1 lists the necessary env vars per provider
 - 010-repo-wide-context: Skills read the whole repository (read-only unchanged); bridge pins cwd to repo root; `max_turns` 6 → 20; constitution amended
 - 009-aioutput-skills: Skills are prompts; Claude read-only; results in `_aioutput/` (`src/ai_output.py`); sync/async modes + `src/async_worker.py`; routes v2.0, bridge 2.0, run-record 1.1, DispatchResult 2.0; warnings to `logs/hooks.log`
