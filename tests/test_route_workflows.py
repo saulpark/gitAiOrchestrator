@@ -1,9 +1,12 @@
-"""Tests for src/route_workflows.py — workflow router (feature 004)."""
+"""Tests for src/route_workflows.py — workflow router (004, modes since 009)."""
+import io
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -11,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from route_workflows import (  # noqa: E402
     RESULT_SCHEMA_VERSION,
     load_config,
+    main,
     route,
     select_plan,
 )
@@ -154,28 +158,9 @@ def test_load_config_unknown_event_key_ignored(tmp_path):
     assert any("post-checkout" in w for w in warnings)
 
 
-# --- skills invoker + CLI (Task 4) ---
-
-OK_RESULT = ('{"schema_version": "1.0", "skill": "x", "status": "ok", '
-             '"summary": "done", "details": {}}')
 
 
-def _make_skill(tmp_path, name,
-                script=f"#!/bin/sh\ncat > /dev/null\nprintf %s '{OK_RESULT}'\n",
-                registered=True):
-    d = tmp_path / "skills" / name
-    d.mkdir(parents=True)
-    run = d / "run"
-    run.write_text(script)
-    run.chmod(0o755)
-    if registered:
-        reg_path = tmp_path / "skills" / "registry.json"
-        reg = json.loads(reg_path.read_text()) if reg_path.exists() else \
-            {"contract_version": "1.1", "skills": {}}
-        reg["skills"][name] = {"dir": name, "version": "1.0.0", "description": name}
-        reg_path.write_text(json.dumps(reg))
-    return d
-
+# --- select_plan ---
 
 def test_select_plan_returns_configured_order():
     warnings = []
@@ -195,6 +180,208 @@ def test_select_plan_unconfigured_event_empty_no_warning():
     assert plan == [] and warnings == []
 
 
+# --- routes v2.0 config (009) ---
+
+def _load(tmp_path, raw):
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps(raw))
+    warnings = []
+    return load_config(str(p), warnings), warnings
+
+
+def test_v2_skill_modes_default_async_and_invalid_warns(tmp_path):
+    cfg, warnings = _load(tmp_path, {"version": "2.0", "routes": {},
+                                     "skills": {"a": {"mode": "sync", "on_failure": "block"},
+                                                "b": {}, "c": {"mode": "later"}}})
+    assert {n: r["mode"] for n, r in cfg["skills"].items()} == \
+        {"a": "sync", "b": "async", "c": "async"}
+    assert len(warnings) == 1 and "later" in warnings[0]
+
+
+def test_v2_block_on_async_skill_warns(tmp_path):
+    _cfg, warnings = _load(tmp_path, {"routes": {},
+                                      "skills": {"a": {"on_failure": "block"}}})
+    assert any("only sync skills block" in w for w in warnings)
+
+
+@pytest.mark.parametrize("value,expected,warned", [
+    (30, 30.0, False), (600, 600.0, False), (0, 120.0, True),
+    (601, 120.0, True), ("soon", 120.0, True), (True, 120.0, True)])
+def test_v2_sync_ceiling_bounds(tmp_path, value, expected, warned):
+    cfg, warnings = _load(tmp_path, {"routes": {}, "sync_ceiling_seconds": value})
+    assert cfg["sync_ceiling_seconds"] == expected
+    assert bool(warnings) is warned
+
+
+def test_v2_retentions(tmp_path):
+    cfg, warnings = _load(tmp_path, {"routes": {}, "run_retention": 7,
+                                     "output_retention": 3})
+    assert (cfg["run_retention"], cfg["output_retention"]) == (7, 3) and warnings == []
+    cfg, warnings = _load(tmp_path, {"routes": {}, "output_retention": -1,
+                                     "run_retention": "many"})
+    assert (cfg["run_retention"], cfg["output_retention"]) == (50, 50)
+    assert len(warnings) == 2
+
+
+def test_legacy_outcomes_fallback_with_deprecation(tmp_path):
+    cfg, warnings = _load(tmp_path, {
+        "version": "1.1", "routes": {},
+        "skills": {"b": {"mode": "sync", "on_failure": "warn"}},
+        "outcomes": {"a": {"on_failure": "block"}, "b": {"on_failure": "block"}}})
+    assert cfg["skills"]["a"] == {"on_failure": "block", "mode": "async"}
+    assert cfg["skills"]["b"]["on_failure"] == "warn"  # skills wins
+    assert any("deprecated" in w for w in warnings)
+
+
+def test_bad_skills_and_outcomes_shapes_ignored(tmp_path):
+    cfg, warnings = _load(tmp_path, {"routes": {}, "skills": ["x"], "outcomes": ["y"]})
+    assert cfg["skills"] == {}
+    assert any("'skills'" in w for w in warnings) and any("'outcomes'" in w for w in warnings)
+
+
+def test_shipped_routes_config_is_clean():
+    warnings = []
+    cfg = load_config(str(REPO_ROOT / "config" / "routes.json"), warnings)
+    assert warnings == [] and cfg["version"] == "2.0"
+
+
+# --- CLI (in-process: the fake bridge stands in for Claude) ---
+
+def _make_skill(tmp_path, name):
+    d = tmp_path / "skills" / name
+    d.mkdir(parents=True)
+    (d / "prompt.md").write_text(f"Task for {name}.")
+    (d / "skill.json").write_text(json.dumps(
+        {"name": name, "version": "1.0.0", "description": name,
+         "input": "hook-context@1.0"}))
+    reg_path = tmp_path / "skills" / "registry.json"
+    reg = json.loads(reg_path.read_text()) if reg_path.exists() else \
+        {"contract_version": "2.0", "skills": {}}
+    reg["skills"][name] = {"dir": name, "version": "1.0.0", "description": name}
+    reg_path.write_text(json.dumps(reg))
+    return d
+
+
+def _fake_bridge(verdict="pass", status="ok"):
+    def bridge(request, config):
+        return {"status": status, "verdict": verdict if status == "ok" else None,
+                "reason": f"verdict {verdict}", "report": "# report",
+                "error": "" if status == "ok" else "claude not found"}
+    return bridge
+
+
+def _no_dispatch(job, jobs_dir):
+    raise AssertionError("unexpected async dispatch")
+
+
+def _main(tmp_path, monkeypatch, capsys, ctx, routes, bridge=None,
+          dispatch=_no_dispatch):
+    cfg = tmp_path / "routes.json"
+    cfg.write_text(json.dumps(routes))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(ctx)))
+    code = main(["--config", str(cfg), "--skills-dir", str(tmp_path / "skills"),
+                 "--root", str(tmp_path), "--log", str(tmp_path / "logs" / "hooks.log"),
+                 "--bridge-config", str(tmp_path / "no-bridge.json")],
+                bridge=bridge or _fake_bridge(), dispatch=dispatch)
+    captured = capsys.readouterr()
+    return code, json.loads(captured.out), captured.err
+
+
+def _gate(event="pre-commit", rule=None, mode="sync"):
+    return {"version": "2.0", "routes": {event: ["gate"]},
+            "skills": {"gate": {"mode": mode, **({"on_failure": rule} if rule else {})}}}
+
+
+def _log(tmp_path):
+    return (tmp_path / "logs" / "hooks.log").read_text(encoding="utf-8")
+
+
+def test_cli_sync_block_exits_ten_with_single_blocked_line(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), _gate(rule="block"),
+                           bridge=_fake_bridge("fail"))
+    assert code == 10
+    lines = err.strip().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("[hook blocked] skill 'gate': verdict fail (see _aioutput/gate/")
+    entry = out["results"][0]
+    assert (entry["mode"], entry["status"], entry["verdict"]) == ("sync", "failure", "fail")
+    assert (tmp_path / entry["output_file"]).exists()
+    assert out["schema_version"] == RESULT_SCHEMA_VERSION == "2.0"
+    rec = json.loads(Path(out["run_record"]).read_text())
+    assert rec["id"] == out["run_id"] and rec["final_outcome"] == "block"
+
+
+def test_cli_warn_is_silent_and_logged(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), _gate(rule="warn"),
+                           bridge=_fake_bridge("fail"))
+    assert code == 0 and err == ""
+    assert out["final_outcome"] == "warn"
+    assert "warning workflow 'gate' failed: verdict fail" in _log(tmp_path)
+
+
+def test_cli_claude_unavailable_never_blocks(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), _gate(rule="block"),
+                           bridge=_fake_bridge(status="unavailable"))
+    assert code == 0 and err == ""
+    assert out["results"][0]["status"] == "error"
+    assert "claude not found" in _log(tmp_path)
+
+
+def test_cli_post_merge_block_downgraded(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx("post-merge"),
+                           _gate("post-merge", rule="block"), bridge=_fake_bridge("fail"))
+    assert code == 0 and err == "" and out["final_outcome"] == "warn"
+
+
+def test_cli_skip_rule_silent_but_recorded(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), _gate(rule="skip"),
+                           bridge=_fake_bridge("fail"))
+    assert code == 0 and err == "" and out["final_outcome"] == "none"
+    assert out["outcomes"][0]["outcome"] == "skip"
+
+
+def test_cli_success_silent(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), _gate(rule="block"))
+    assert code == 0 and err == "" and out["final_outcome"] == "none"
+
+
+def test_cli_async_skill_dispatched_with_job(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "gate")
+    jobs = []
+
+    def dispatch(job, jobs_dir):
+        jobs.append((job, jobs_dir))
+        return True, "", "logs/async/x.json"
+
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(),
+                           _gate(rule="block", mode="async"), dispatch=dispatch)
+    assert code == 0 and err == ""
+    assert out["results"][0]["status"] == "dispatched"
+    job, jobs_dir = jobs[0]
+    assert job["run_id"] == out["run_id"] and job["plan"] == ["gate"]
+    assert job["outcome_rules"]["gate"]["mode"] == "async"
+    assert jobs_dir == str(tmp_path / "logs" / "async")
+
+
+def test_cli_mixed_plan_shape(tmp_path, monkeypatch, capsys):
+    _make_skill(tmp_path, "good")
+    routes = {"version": "2.0", "routes": {"pre-commit": ["good", "ghost"]},
+              "skills": {"good": {"mode": "sync"}, "ghost": {"mode": "sync"}}}
+    code, out, err = _main(tmp_path, monkeypatch, capsys, _ctx(), routes)
+    entries = {e["workflow"]: e for e in out["results"]}
+    assert entries["good"]["outcome"] == "invoked"
+    assert entries["ghost"]["outcome"] == "unresolvable"
+    assert out["overall"] == "partial-failure" and code == 0 and err == ""
+
+
+# --- CLI as a subprocess (no skills, so no Claude) ---
+
 def _run_cli(stdin_text, *args, cwd=None):
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "src" / "route_workflows.py"), *args],
@@ -205,133 +392,36 @@ def _run_cli(stdin_text, *args, cwd=None):
 
 def test_cli_routes_context_from_stdin_exit_zero(tmp_path):
     cfg = tmp_path / "routes.json"
-    cfg.write_text('{"version": "1.0", "routes": {"pre-commit": []}}')
-    r = _run_cli(json.dumps(_ctx()), "--config", str(cfg))
-    assert r.returncode == 0
+    cfg.write_text('{"version": "2.0", "routes": {"pre-commit": []}}')
+    r = _run_cli(json.dumps(_ctx()), "--config", str(cfg), "--root", str(tmp_path))
+    assert r.returncode == 0 and r.stderr == ""
     out = json.loads(r.stdout)
     assert out["event"] == "pre-commit" and out["results"] == []
-    assert out["schema_version"] == RESULT_SCHEMA_VERSION
-    assert out["overall"] == "empty"
-    assert out["execution"]["results"] == []
+    assert out["overall"] == "empty" and out["execution"]["results"] == []
+    assert list((tmp_path / "logs" / "runs").glob("*.json"))
 
 
-def test_load_config_accepts_outcomes_and_retention(tmp_path):
-    p = tmp_path / "routes.json"
-    p.write_text(json.dumps({
-        "version": "1.1", "routes": {"pre-commit": ["a"]},
-        "outcomes": {"a": {"on_failure": "block"}}, "run_retention": 7}))
-    warnings = []
-    cfg = load_config(str(p), warnings)
-    assert cfg["outcomes"] == {"a": {"on_failure": "block"}}
-    assert cfg["run_retention"] == 7
-    assert warnings == []
+def test_cli_garbage_stdin_exit_zero_and_logged(tmp_path):
+    log = tmp_path / "hooks.log"
+    r = _run_cli("{not json", "--log", str(log), "--root", str(tmp_path))
+    assert r.returncode == 0 and r.stderr == ""
+    assert "unreadable context" in log.read_text()
 
 
-def test_load_config_bad_outcomes_shape_ignored_with_warning(tmp_path):
-    p = tmp_path / "routes.json"
-    p.write_text('{"version": "1.1", "routes": {}, "outcomes": ["nope"], "run_retention": "many"}')
-    warnings = []
-    cfg = load_config(str(p), warnings)
-    assert cfg["outcomes"] == {} and cfg["run_retention"] == 50
-    assert any("outcomes" in w for w in warnings)
-    assert any("run_retention" in w for w in warnings)
-
-
-def _outcome_cli(tmp_path, rule, event="pre-commit", skill_script="#!/bin/sh\nexit 1\n"):
-    _make_skill(tmp_path, "gate", script=skill_script)
-    cfg = tmp_path / "routes.json"
-    outcomes = {"gate": rule} if rule else {}
-    cfg.write_text(json.dumps({"version": "1.1", "routes": {event: ["gate"]},
-                               "outcomes": outcomes}))
-    runs = tmp_path / "runs"
-    return _run_cli(json.dumps(_ctx(event)), "--config", str(cfg),
-                    "--skills-dir", str(tmp_path / "skills"),
-                    "--runs-dir", str(runs)), runs
-
-
-def test_cli_block_rule_exits_ten_with_message(tmp_path):
-    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"})
-    assert r.returncode == 10
-    assert "[hook blocked]" in r.stderr and "gate" in r.stderr
-    out = json.loads(r.stdout)
-    assert out["final_outcome"] == "block"
-    assert out["run_record"] and (runs / Path(out["run_record"]).name).exists()
-
-
-def test_cli_default_warn_exits_zero_with_warning(tmp_path):
-    r, runs = _outcome_cli(tmp_path, None)
-    assert r.returncode == 0
-    assert "[router warning]" in r.stderr
-    assert json.loads(r.stdout)["final_outcome"] == "warn"
-
-
-def test_cli_skip_rule_silent_but_recorded(tmp_path):
-    r, runs = _outcome_cli(tmp_path, {"on_failure": "skip"})
-    assert r.returncode == 0
-    assert "[router warning]" not in r.stderr and "[hook blocked]" not in r.stderr
-    out = json.loads(r.stdout)
-    assert out["final_outcome"] == "none"
-    rec = json.loads(next(runs.glob("*.json")).read_text())
-    assert rec["results"][0]["outcome"] == "skip"
-
-
-def test_cli_post_merge_block_downgraded(tmp_path):
-    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"}, event="post-merge")
-    assert r.returncode == 0
-    assert "[hook blocked]" not in r.stderr and "[router warning]" in r.stderr
-    out = json.loads(r.stdout)
-    assert out["final_outcome"] == "warn"
-
-
-def test_cli_success_writes_record_no_messages(tmp_path):
-    r, runs = _outcome_cli(tmp_path, {"on_failure": "block"},
-                           skill_script=f"#!/bin/sh\ncat > /dev/null\nprintf %s '{OK_RESULT}'\n")
-    assert r.returncode == 0
-    assert r.stderr.strip() == ""
-    out = json.loads(r.stdout)
-    assert out["final_outcome"] == "none"
-    assert len(list(runs.glob("*.json"))) == 1
-
-
-def test_cli_dispatch_via_executor_v11_shape(tmp_path):
-    _make_skill(tmp_path, "good")
-    _make_skill(tmp_path, "bad", script="#!/bin/sh\nexit 1\n")
-    cfg = tmp_path / "routes.json"
-    cfg.write_text('{"version": "1.0", "routes": {"pre-commit": ["good", "bad", "ghost"]}}')
-    r = _run_cli(json.dumps(_ctx()), "--config", str(cfg),
-                 "--skills-dir", str(tmp_path / "skills"))
-    assert r.returncode == 0
-    out = json.loads(r.stdout)
-    entries = {e["workflow"]: e for e in out["results"]}
-    assert entries["good"]["outcome"] == "invoked"
-    assert entries["good"]["status"] == "success"
-    assert entries["bad"]["outcome"] == "failed"
-    assert entries["bad"]["status"] == "failure"
-    assert entries["ghost"]["outcome"] == "unresolvable"
-    assert entries["ghost"]["status"] == "skipped"
-    assert all(isinstance(e["duration_ms"], int) for e in out["results"])
-    assert out["overall"] == "partial-failure"
-    assert [e["skill"] for e in out["execution"]["results"]] == ["good", "bad", "ghost"]
-    assert "ghost" in r.stderr and "bad" in r.stderr  # warnings still visible
-
-
-def test_cli_garbage_stdin_exit_zero_with_warning():
-    r = _run_cli("{not json")
-    assert r.returncode == 0
-    assert "[router warning]" in r.stderr
-
-
-def test_cli_missing_config_warns_on_stderr(tmp_path):
-    r = _run_cli(json.dumps(_ctx()), "--config", str(tmp_path / "none.json"))
-    assert r.returncode == 0
-    assert "[router warning]" in r.stderr
+def test_cli_missing_config_logged(tmp_path):
+    log = tmp_path / "hooks.log"
+    r = _run_cli(json.dumps(_ctx()), "--config", str(tmp_path / "none.json"),
+                 "--log", str(log), "--root", str(tmp_path))
+    assert r.returncode == 0 and r.stderr == ""
+    assert "routing config not found" in log.read_text()
 
 
 def test_cli_log_appends_summary_line(tmp_path):
     cfg = tmp_path / "routes.json"
-    cfg.write_text('{"version": "1.0", "routes": {"pre-commit": []}}')
+    cfg.write_text('{"version": "2.0", "routes": {"pre-commit": []}}')
     log = tmp_path / "hooks.log"
-    _run_cli(json.dumps(_ctx()), "--config", str(cfg), "--log", str(log))
+    _run_cli(json.dumps(_ctx()), "--config", str(cfg), "--log", str(log),
+             "--root", str(tmp_path))
     line = log.read_text().strip()
     assert "pre-commit" in line and line.startswith("[")
 
@@ -339,7 +429,7 @@ def test_cli_log_appends_summary_line(tmp_path):
 def test_selection_under_100ms(tmp_path):
     cfg = tmp_path / "routes.json"
     cfg.write_text(json.dumps(
-        {"version": "1.0", "routes": {"pre-commit": [f"wf{i}" for i in range(100)]}}))
+        {"version": "2.0", "routes": {"pre-commit": [f"wf{i}" for i in range(100)]}}))
     warnings = []
     t0 = time.monotonic()
     config = load_config(str(cfg), warnings)

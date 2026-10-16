@@ -1,5 +1,7 @@
 # Contract: Run Record & Outcome Enforcement
 
+> **Superseded in part by 009** — run-record `1.1`, routes `2.0` (`skills.<name>.{mode,on_failure}`), and only a sync skill's `failure` can block. See `specs/009-aioutput-skills/contracts/execution-and-output.md`.
+
 **Branch**: `008-run-observability` | **Date**: 2026-07-19
 **Schema versions**: run-record `1.0`; routes config `1.1`; DispatchResult `1.2`
 

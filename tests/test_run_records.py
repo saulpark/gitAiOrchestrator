@@ -1,8 +1,10 @@
-"""Tests for src/run_records.py — run observability (feature 008)."""
+"""Tests for src/run_records.py — run observability (008, modes since 009)."""
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -23,9 +25,9 @@ def _summary(*results, event="pre-commit"):
             "results": list(results)}
 
 
-def _r(skill, status, detail="boom"):
-    return {"skill": skill, "status": status, "duration_ms": 5,
-            "detail": detail, "result": None}
+def _r(skill, status, detail="boom", mode="sync"):
+    return {"skill": skill, "mode": mode, "status": status, "verdict": None,
+            "output_file": None, "duration_ms": 5, "detail": detail}
 
 
 CTX = {"event": "pre-commit", "branch": "main", "files": ["a.py"],
@@ -58,11 +60,45 @@ def test_block_warn_skip_rules_honored():
     assert ev["final_outcome"] == "block"
 
 
-def test_all_nonsuccess_statuses_trigger_rule():
-    rules = {"s": {"on_failure": "block"}}
-    for status in ("failure", "timeout", "skipped"):
-        ev = evaluate_outcomes(_summary(_r("s", status)), rules, "pre-commit")
-        assert ev["results"][0]["outcome"] == "block", status
+@pytest.mark.parametrize("status", ["error", "timeout", "skipped", "dispatch-failed"])
+def test_only_failure_can_block_tooling_problems_downgrade(status):
+    ev = evaluate_outcomes(_summary(_r("s", status)),
+                           {"s": {"on_failure": "block"}}, "pre-commit")
+    entry = ev["results"][0]
+    assert entry["outcome"] == "warn" and ev["block_downgraded"] is True
+    assert f"cannot block on '{status}'" in entry["reason"]
+
+
+def test_skip_rule_still_silences_tooling_problems():
+    ev = evaluate_outcomes(_summary(_r("s", "error")),
+                           {"s": {"on_failure": "skip"}}, "pre-commit")
+    assert ev["results"][0]["outcome"] == "skip"
+
+
+def test_async_failure_never_blocks():
+    ev = evaluate_outcomes(_summary(_r("s", "failure", mode="async")),
+                           {"s": {"mode": "async", "on_failure": "block"}}, "pre-commit")
+    assert ev["results"][0]["outcome"] == "warn"
+    assert "async" in ev["results"][0]["reason"]
+
+
+def test_dispatched_is_none():
+    ev = evaluate_outcomes(_summary(_r("s", "dispatched", mode="async")),
+                           {"s": {"on_failure": "block"}}, "pre-push")
+    assert ev["final_outcome"] == "none"
+
+
+def test_rule_with_only_mode_is_silent_default_warn():
+    ev = evaluate_outcomes(_summary(_r("s", "failure")), {"s": {"mode": "sync"}},
+                           "pre-commit")
+    assert ev["results"][0]["outcome"] == "warn" and ev["notes"] == []
+
+
+def test_entries_carry_mode_verdict_output_file():
+    r = {**_r("s", "failure"), "verdict": "fail", "output_file": "_aioutput/s/x.md"}
+    entry = evaluate_outcomes(_summary(r), {}, "pre-commit")["results"][0]
+    assert (entry["mode"], entry["verdict"], entry["output_file"]) == \
+        ("sync", "fail", "_aioutput/s/x.md")
 
 
 def test_invalid_rule_value_defaults_to_warn_with_note():
@@ -115,7 +151,7 @@ def _make_record(event="pre-commit", results=None):
 
 def test_record_carries_required_fields():
     rec = _make_record()
-    assert rec["schema_version"] == "1.0"
+    assert rec["schema_version"] == "1.1"
     assert rec["event"] == "pre-commit" and rec["branch"] == "main"
     assert rec["timestamp"].endswith("Z") and rec["id"]
     assert rec["plan"] == ["s"]
@@ -124,6 +160,18 @@ def test_record_carries_required_fields():
         assert key in entry
     assert rec["final_outcome"] == "warn"
     assert rec["context_summary"]["files"] == 1
+
+
+def test_record_uses_given_id_and_marks_async_lineage():
+    summary = {**_summary(_r("s", "dispatched", mode="async")),
+               "async_job": "logs/async/R1.json"}
+    ev = evaluate_outcomes(summary, {}, "pre-commit")
+    rec = build_run_record(CTX, ["s"], summary, ev, [], run_id="R1")
+    assert rec["id"] == "R1" and rec["async_job"] == "logs/async/R1.json"
+    assert "parent_run" not in rec
+    worker = build_run_record(CTX, ["s"], _summary(), ev, [], run_id="R1-async",
+                              parent_run="R1")
+    assert worker["parent_run"] == "R1" and worker["async_job"] is None
 
 
 def test_write_read_and_ordering(tmp_path):
@@ -184,3 +232,15 @@ def test_cli_list_and_show(tmp_path):
 def test_cli_show_unknown_id_exit_one(tmp_path):
     r = _run_cli("show", "nope", "--runs-dir", str(tmp_path / "runs"), cwd=tmp_path)
     assert r.returncode == 1
+
+
+def test_cli_show_renders_mode_verdict_output(tmp_path):
+    runs = str(tmp_path / "runs")
+    r = {**_r("todo", "failure"), "verdict": "fail", "output_file": "_aioutput/todo/x.md"}
+    summary = _summary(r)
+    ev = evaluate_outcomes(summary, {"todo": {"on_failure": "block"}}, "pre-commit")
+    write_run_record(runs, build_run_record(CTX, ["todo"], summary, ev, [],
+                                            run_id="R1-async", parent_run="R1"), 5)
+    out = _run_cli("show", "--last", "--runs-dir", runs, cwd=tmp_path).stdout
+    assert "[sync]" in out and "verdict=fail" in out
+    assert "_aioutput/todo/x.md" in out and "worker for run R1" in out

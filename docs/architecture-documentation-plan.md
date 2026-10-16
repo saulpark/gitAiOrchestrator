@@ -6,6 +6,17 @@
 **Depends on:** 001–008 (complete), 010 (async mode + manual entry point)
 **Companion plan:** [`living-documentation-roadmap.md`](living-documentation-roadmap.md)
 
+> **Superseded in part by feature 009 (`specs/009-aioutput-skills/`, 2026-10-02).**
+> Feature numbers in this document shift by three (009→012, 010→013, 011→014, 012→015):
+> 009 became the `_aioutput` skills, 010 repo-wide read context, 011 the installer check.
+> Constitution principles 1, 3 and 8 were amended by 010: Claude may now read the whole
+> repository (read-only); the "bounded context" wording below is the pre-010 text.
+> Since 009, skills are declarative prompts and Claude runs **read-only**; results go to
+> `_aioutput/` only. Anything below that relies on a Python skill or on Claude editing
+> project files is incompatible as written and must be re-scoped (e.g. emit proposals to
+> `_aioutput/`) before it is specified. 009 also delivers per-skill async execution,
+> overlapping the async-mode feature planned here.
+
 ---
 
 ## 1. Purpose

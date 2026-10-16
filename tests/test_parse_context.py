@@ -1,9 +1,12 @@
 """Tests for src/parse_context.py — hook context parser (feature 003)."""
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -128,10 +131,24 @@ def test_detached_head_branch_is_valid():
     assert ctx["branch"] == "HEAD" and ctx["partial"] is False
 
 
+# Windows cannot even start Python without SYSTEMROOT; it carries no hook data.
+_PLATFORM_ENV = ({"SYSTEMROOT": os.environ["SYSTEMROOT"]}
+                 if "SYSTEMROOT" in os.environ else {})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are Windows-only")
+def test_path_on_other_drive_dropped_with_error():
+    ctx = parse_context(_env(HOOK_EVENT="pre-commit", HOOK_BRANCH="b",
+                             HOOK_FILES="Z:\\elsewhere\\x.py\nC:\\repo\\src\\y.py"),
+                        "C:\\repo")
+    assert ctx["files"] == ["src/y.py"]
+    assert any("outside repository" in e for e in ctx["errors"])
+
+
 def _run_cli(env):
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "src" / "parse_context.py")],
-        env={"PATH": "/usr/bin:/bin", **env}, cwd=REPO_ROOT,
+        env={"PATH": "/usr/bin:/bin", **_PLATFORM_ENV, **env}, cwd=REPO_ROOT,
         capture_output=True, text=True, timeout=10,
     )
 

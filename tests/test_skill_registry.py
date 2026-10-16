@@ -1,7 +1,10 @@
-"""Tests for src/skill_registry.py — skill contract + registry (feature 005)."""
+"""Tests for src/skill_registry.py — skill contract v2.0 + registry (005, 009)."""
 import json
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -20,20 +23,17 @@ GOOD_MANIFEST = {
     "version": "1.0.0",
     "description": "Regenerates docs for changed modules",
     "input": "hook-context@1.0",
-    "output": "skill-result@1.0",
-    "behaviors": {"non_blocking": True, "idempotent": True},
 }
 
 
-def _make_skill(tmp_path, manifest=GOOD_MANIFEST, run=True, dirname="doc-sync"):
+def _make_skill(tmp_path, manifest=GOOD_MANIFEST, prompt="Summarize the changes.",
+                dirname="doc-sync"):
     d = tmp_path / "skills" / dirname
     d.mkdir(parents=True)
     if manifest is not None:
         (d / "skill.json").write_text(json.dumps(manifest))
-    if run:
-        r = d / "run"
-        r.write_text("#!/bin/sh\ncat > /dev/null\nexit 0\n")
-        r.chmod(0o755)
+    if prompt is not None:
+        (d / "prompt.md").write_text(prompt)
     return d
 
 
@@ -63,19 +63,11 @@ def test_each_field_violation_is_named(tmp_path):
         "version": {**GOOD_MANIFEST, "version": "1.0"},
         "description": {**GOOD_MANIFEST, "description": ""},
         "input": {**GOOD_MANIFEST, "input": "custom@2"},
-        "output": {**GOOD_MANIFEST, "output": "whatever"},
-        "behaviors": {**GOOD_MANIFEST, "behaviors": {"idempotent": True}},
     }
     for rule, manifest in cases.items():
         d = _make_skill(tmp_path, manifest, dirname=f"case-{rule}")
         rules = _violation_rules(validate_manifest(str(d)))
         assert rule in rules, f"expected {rule} in {rules}"
-
-
-def test_non_blocking_false_violates_behaviors(tmp_path):
-    m = {**GOOD_MANIFEST, "behaviors": {"non_blocking": False, "idempotent": True}}
-    d = _make_skill(tmp_path, m)
-    assert "behaviors" in _violation_rules(validate_manifest(str(d)))
 
 
 def test_reserved_name_rejected(tmp_path):
@@ -84,26 +76,57 @@ def test_reserved_name_rejected(tmp_path):
     assert "name-reserved" in _violation_rules(validate_manifest(str(d)))
 
 
-def test_missing_run_is_entry_point_violation(tmp_path):
-    d = _make_skill(tmp_path, run=False)
-    assert "entry-point" in _violation_rules(validate_manifest(str(d)))
+def test_v1_fields_are_no_longer_required(tmp_path):
+    # output/behaviors were v1.1 fields; a v2.0 manifest without them is valid.
+    assert validate_manifest(str(_make_skill(tmp_path))) == []
 
 
-def test_non_executable_run_is_entry_point_violation(tmp_path):
+def test_missing_prompt_is_violation(tmp_path):
+    d = _make_skill(tmp_path, prompt=None)
+    assert "prompt" in _violation_rules(validate_manifest(str(d)))
+
+
+def test_blank_prompt_is_violation(tmp_path):
+    d = _make_skill(tmp_path, prompt="  \n\t ")
+    assert "prompt" in _violation_rules(validate_manifest(str(d)))
+
+
+@pytest.mark.parametrize("filename", ["run", "helper.py", "sub/tool.sh", "x.exe"])
+def test_code_file_is_executable_code_violation(tmp_path, filename):
     d = _make_skill(tmp_path)
-    (d / "run").chmod(0o644)
-    assert "entry-point" in _violation_rules(validate_manifest(str(d)))
+    target = d / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\necho hi\n")
+    violations = validate_manifest(str(d))
+    assert "executable-code" in _violation_rules(violations)
+    assert any(filename in v for v in violations)
+
+
+def test_extra_markdown_is_allowed(tmp_path):
+    d = _make_skill(tmp_path)
+    (d / "README.md").write_text("notes")
+    assert validate_manifest(str(d)) == []
+
+
+# Windows has no executable bit: os.access(X_OK) is always true there, so the
+# exec-bit half of the rule only exists on POSIX.
+@pytest.mark.skipif(os.name == "nt", reason="no executable bit on Windows")
+def test_executable_markdown_is_violation(tmp_path):
+    d = _make_skill(tmp_path)
+    (d / "prompt.md").chmod(0o755)
+    assert "executable-code" in _violation_rules(validate_manifest(str(d)))
 
 
 def test_all_violations_reported_in_one_pass(tmp_path):
-    d = _make_skill(tmp_path, manifest={}, run=False)
+    d = _make_skill(tmp_path, manifest={}, prompt=None)
+    (d / "run").write_text("x")
     rules = _violation_rules(validate_manifest(str(d)))
-    assert {"name", "version", "description", "input", "output",
-            "behaviors", "entry-point"} <= rules
+    assert {"name", "version", "description", "input", "prompt",
+            "executable-code"} <= rules
 
 
-def test_contract_version_is_one_one():
-    assert CONTRACT_VERSION == "1.1"
+def test_contract_version_is_two_zero():
+    assert CONTRACT_VERSION == "2.0"
 
 
 def test_invalid_time_budget_is_violation(tmp_path):
@@ -135,9 +158,9 @@ def test_register_compliant_skill_writes_registry(tmp_path):
 
 
 def test_rejected_skill_not_written(tmp_path):
-    d = _make_skill(tmp_path, manifest={}, run=False)
+    d = _make_skill(tmp_path, manifest={}, prompt=None)
     ok, messages = register_skill(_skills_dir(tmp_path), str(d))
-    assert not ok and len(messages) >= 6
+    assert not ok and len(messages) >= 5
     assert not (tmp_path / "skills" / "registry.json").exists() or \
         json.loads((tmp_path / "skills" / "registry.json").read_text())["skills"] == {}
 
@@ -182,13 +205,13 @@ def test_load_registry_missing_or_corrupt(tmp_path):
 def test_validate_registry_flags_broken_skill_and_drift(tmp_path):
     d = _make_skill(tmp_path)
     register_skill(_skills_dir(tmp_path), str(d))
-    (d / "run").unlink()  # break the skill after registration
+    (d / "prompt.md").unlink()  # break the skill after registration
     reg_path = tmp_path / "skills" / "registry.json"
     reg = json.loads(reg_path.read_text())
     reg["contract_version"] = "0.9"  # simulate contract drift
     reg_path.write_text(json.dumps(reg))
     report = validate_registry(_skills_dir(tmp_path))
-    assert any("entry-point" in v for v in report["skills"]["doc-sync"])
+    assert any("prompt" in v for v in report["skills"]["doc-sync"])
     assert report["contract_version_drift"]
 
 
@@ -222,11 +245,10 @@ def test_cli_register_ok_then_duplicate_then_update(tmp_path):
 
 
 def test_cli_register_rejection_lists_all_violations(tmp_path):
-    d = _make_skill(tmp_path, manifest={}, run=False, dirname="bad")
+    d = _make_skill(tmp_path, manifest={}, prompt=None, dirname="bad")
     r = _run_cli("register", str(d), "--skills-dir", _skills_dir(tmp_path), cwd=tmp_path)
     assert r.returncode == 1
-    for rule in ("name", "version", "description", "input", "output",
-                 "behaviors", "entry-point"):
+    for rule in ("name", "version", "description", "input", "prompt"):
         assert rule in r.stderr
 
 
@@ -246,6 +268,6 @@ def test_cli_validate_exit_codes(tmp_path):
     _run_cli("register", str(d), "--skills-dir", _skills_dir(tmp_path), cwd=tmp_path)
     assert _run_cli("validate", "--skills-dir", _skills_dir(tmp_path),
                     cwd=tmp_path).returncode == 0
-    (d / "run").unlink()
+    (d / "prompt.md").unlink()
     r = _run_cli("validate", "--skills-dir", _skills_dir(tmp_path), cwd=tmp_path)
     assert r.returncode == 1 and "doc-sync" in r.stderr

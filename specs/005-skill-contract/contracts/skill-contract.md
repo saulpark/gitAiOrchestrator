@@ -1,5 +1,7 @@
 # Skill Contract — v1.1
 
+> **Superseded by 009** — skills are now declarative (`skill.json` + `prompt.md`, no executable code). The current contract is `specs/009-aioutput-skills/contracts/skill-contract.md` (v2.0).
+
 **The standalone, authoritative definition of what a skill must declare and exhibit.**
 Read this before writing a skill; a compliant skill registers on the first attempt (SC-001).
 

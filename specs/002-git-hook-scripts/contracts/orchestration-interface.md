@@ -1,5 +1,7 @@
 # Contract: Orchestration Interface
 
+> **Superseded in part by 009** — the hook timeout is now `HOOK_CEILING_SECONDS=610` and non-block warnings go to `logs/hooks.log`, not stderr. See `specs/009-aioutput-skills/contracts/execution-and-output.md`.
+
 **Branch**: `002-git-hook-scripts` | **Date**: 2026-05-23
 
 This contract defines how hook scripts invoke the orchestration entry point. It is the boundary between this feature (002) and the orchestration layer (003/004).
