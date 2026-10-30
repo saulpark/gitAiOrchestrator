@@ -458,7 +458,7 @@ Two layers, deliberately: `.githooks/<event>` is a two-line shim that `exec`s
 Invariant: a broken, missing, or slow orchestration can only ever be *logged*.
 
 `_run_with_timeout` only trusts a `timeout` that identifies itself as GNU (`--version`).
-Windows ships its own, unrelated `System32	imeout.exe`, which rejects the call with exit 1
+Windows ships its own, unrelated `System32\timeout.exe`, which rejects the call with exit 1
 and would silently skip every skill (seen from GitHub Desktop). Anything else falls back
 to the POSIX watchdog.
 
@@ -509,7 +509,9 @@ it on stdin to `claude -p` with the fixed read-only confinement (§4), and
 parses the structured `{verdict, reason, report}` answer into a `bridge-result@2.0`: `ok` /
 `error` / `timeout` / `unavailable` / `bad-request`. A CLI older than 2.1.287 (which lacks
 the confinement flags) is `unavailable`, never run unconfined. Config: `claude_command`,
-`model`, `max_turns` (20), `timeout_seconds` (120).
+`model`, `max_turns` (20), `timeout_seconds` (120). On Windows the `claude` child is started
+with `CREATE_NO_WINDOW` (012): without it, an async run opened a console window whose
+closing killed the skill.
 
 ### 008 — Run observability & outcome enforcement (`src/run_records.py`, `logs/runs/`)
 

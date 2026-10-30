@@ -44,7 +44,7 @@ _finish_hook() {
 }
 
 # Print the name of a GNU-compatible timeout command (timeout, then gtimeout), or
-# nothing. The name alone is not enough: on Windows, System32	imeout.exe is a
+# nothing. The name alone is not enough: on Windows, System32\timeout.exe is a
 # different program that rejects `timeout 610 cmd` with exit 1 and would skip the
 # whole pipeline, so each candidate must identify itself as GNU via --version.
 _gnu_timeout() {
