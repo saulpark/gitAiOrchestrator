@@ -15,9 +15,11 @@ from claude_bridge import (  # noqa: E402
     DEFAULT_CONFIG,
     RESULT_SCHEMA_VERSION,
     VERDICT_SCHEMA,
+    _default_runner,
     build_argv,
     build_prompt,
     cli_supports_confinement,
+    hidden_window_kwargs,
     invoke,
     load_bridge_config,
     parse_verdict,
@@ -388,3 +390,31 @@ def test_cli_garbage_stdin_bad_request(tmp_path):
     r = _run_cli(tmp_path, "{nope")
     assert r.returncode == 0
     assert json.loads(r.stdout)["status"] == "bad-request"
+
+
+# --- 012: no console window for the Claude child on Windows --------------------
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def test_hidden_window_kwargs_sets_create_no_window_on_windows():
+    assert hidden_window_kwargs("nt")["creationflags"] & CREATE_NO_WINDOW
+
+
+def test_hidden_window_kwargs_is_empty_elsewhere():
+    assert hidden_window_kwargs("posix") == {}
+
+
+@pytest.mark.parametrize("platform,expected", [("nt", True), ("posix", False)])
+def test_default_runner_hides_the_window_only_on_windows(monkeypatch, platform, expected):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "out", "err")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    code, out, err = _default_runner(["claude"], "prompt", 5, cwd="/repo", platform=platform)
+    assert (code, out, err) == (0, "out", "err")
+    assert ("creationflags" in seen) is expected
+    assert seen["input"] == "prompt" and seen["cwd"] == "/repo" and seen["timeout"] == 5

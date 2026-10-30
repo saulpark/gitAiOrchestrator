@@ -233,8 +233,22 @@ def parse_verdict(payload) -> tuple[dict | None, str]:
     return {"verdict": verdict, "reason": reason, "report": report}, ""
 
 
+def hidden_window_kwargs(platform: str = os.name) -> dict:
+    """subprocess kwargs that stop the claude child from opening a console. Pure.
+
+    The async worker has no console (DETACHED_PROCESS). A console program it
+    starts then gets its own visible window on Windows, and closing that window
+    kills the run (012). CREATE_NO_WINDOW gives the child no console at all;
+    its output is captured through pipes either way.
+    """
+    if platform == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
 def _default_runner(argv: list[str], prompt_stdin: str | None,
-                    timeout: float, cwd: str | None = None) -> tuple[int, str, str]:
+                    timeout: float, cwd: str | None = None,
+                    platform: str = os.name) -> tuple[int, str, str]:
     """Real subprocess invocation. Swappable via invoke(runner=...) so the
     bridge can be tested end to end without the claude CLI installed.
 
@@ -243,7 +257,8 @@ def _default_runner(argv: list[str], prompt_stdin: str | None,
     """
     proc = subprocess.run(argv, input=prompt_stdin, text=True,
                           encoding="utf-8", errors="replace",
-                          capture_output=True, timeout=timeout, cwd=cwd)
+                          capture_output=True, timeout=timeout, cwd=cwd,
+                          **hidden_window_kwargs(platform))
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -254,7 +269,7 @@ def _cli_version(command: str) -> str:
     try:
         proc = subprocess.run([command, "--version"], capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
-                              timeout=15)
+                              timeout=15, **hidden_window_kwargs())
         return proc.stdout
     except (OSError, subprocess.SubprocessError):
         return ""
